@@ -1,0 +1,21 @@
+[package]
+name    = "woven-render"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+woven-common = { path = "../woven-common" }
+
+tokio               = { workspace = true }
+anyhow              = { workspace = true }
+thiserror           = { workspace = true }
+serde               = { workspace = true }
+tracing             = { workspace = true }
+crossbeam-channel   = { workspace = true }
+tiny-skia = { workspace = true }
+fontdue   = { workspace = true }
+
+smithay-client-toolkit = { workspace = true }
+wayland-client         = { workspace = true }
+wayland-protocols      = { workspace = true }
+wayland-protocols-wlr  = { workspace = true }

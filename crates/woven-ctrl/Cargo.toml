@@ -1,0 +1,17 @@
+[package]
+name        = "woven-ctrl"
+version     = "0.1.0"
+edition     = "2021"
+description = "woven control panel — theme editor, first-run setup, config management"
+
+[[bin]]
+name = "woven-ctrl"
+path = "src/main.rs"
+
+[dependencies]
+woven-common = { path = "../woven-common" }
+anyhow       = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+tokio        = { version = "1", features = ["full"] }
+iced         = { version = "0.14", features = ["tokio", "advanced"] }

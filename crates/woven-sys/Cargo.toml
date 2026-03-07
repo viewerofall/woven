@@ -1,0 +1,33 @@
+[package]
+name        = "woven-sys"
+version     = "0.1.0"
+edition     = "2021"
+description = "woven systems layer — compositor IPC, Lua runtime, proc metrics"
+license     = "MIT"
+
+[[bin]]
+name = "woven"
+path = "src/main.rs"
+
+[dependencies]
+woven-common = { path = "../woven-common" }
+woven-render = { path = "../woven-render" }
+
+tokio       = { workspace = true }
+anyhow      = { workspace = true }
+thiserror   = { workspace = true }
+async-trait = { workspace = true }
+mlua        = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+smithay-client-toolkit = { workspace = true }
+wayland-client         = { workspace = true }
+wayland-protocols      = { workspace = true }
+wayland-protocols-wlr  = { workspace = true }
+
+crossbeam-channel = { workspace = true }
+xcb               = { workspace = true }
