@@ -48,8 +48,6 @@ Woven is currently in early development. Here is what we are working on:
 * Wayland compositor (e.g., Hyprland) or X11 Window Manager
 * Hyprland
 
-### Build from Source
-Later.
-git clone [https://github.com/yourusername/woven.git](https://github.com/yourusername/woven.git)
-cd woven
-cargo build --release
+### Installation
+**NOT** Releasable currently
+Services and other things arent currently released with the compressed package, buisness releases for the future
