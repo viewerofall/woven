@@ -12,50 +12,46 @@ local layout    = require("ui.layout")
 
 local M = {}
 
-function M.start()
+function M.start(rust_theme_push, rust_workspaces_push)
 woven.log.info("core: initializing")
 
--- expose woven.settings() so user config can call it
--- routes into layout and animation modules
+-- wire woven.settings() — pure Lua layout/animation settings
 woven.settings = function(values)
 layout.apply_settings(values)
+animation.apply(values)
 woven.log.info("settings: applied")
 end
 
--- expose woven.workspaces() config call
+-- wire woven.workspaces() — Lua layout side + Rust render side
 woven.workspaces = function(values)
 layout.apply_workspace(values)
 layout.apply_popout(values)
-end
+if rust_workspaces_push then rust_workspaces_push(values) end
+    end
 
--- expose woven.animations() config call
-woven.animations = function(values)
-animation.apply(values)
-end
+    -- wire woven.animations() — pure Lua
+    woven.animations = function(values)
+    animation.apply(values)
+    end
 
--- save the raw Rust binding BEFORE we override woven.theme
--- theme.apply() calls this directly to push values to Rust
--- without going through our override (which would recurse forever)
-local _rust_theme_push = woven.theme
+    -- wire woven.theme() through ui.theme merge logic, then push to Rust
+    woven.theme = function(values)
+    theme.apply(values, rust_theme_push)
+    end
 
--- override woven.theme() to go through ui.theme module for merge logic
-woven.theme = function(values)
-theme.apply(values, _rust_theme_push)
-end
+    -- fetch initial compositor state
+    workspace.refresh()
 
--- fetch initial compositor state
-workspace.refresh()
+    -- start metric polling
+    metrics.start_polling(2000)
 
--- start metric polling
-metrics.start_polling(2000)
+    -- init hook system (installs woven.on / woven.bind)
+    hooks.init()
 
--- init hook system (installs woven.on / woven.bind)
-hooks.init()
+    woven.log.info("core: ready — overlay waiting for toggle")
 
-woven.log.info("core: ready — overlay waiting for toggle")
+    -- init overlay (non-blocking, waits for key events from woven-render)
+    overlay.init()
+    end
 
--- init overlay (non-blocking, waits for key events from woven-render)
-overlay.init()
-end
-
-return M
+    return M

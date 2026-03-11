@@ -4390,6 +4390,7 @@ dependencies = [
  "anyhow",
  "crossbeam-channel",
  "fontdue",
+ "rustix 0.38.44",
  "serde",
  "smithay-client-toolkit 0.19.2",
  "thiserror 2.0.18",

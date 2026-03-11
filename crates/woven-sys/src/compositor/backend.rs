@@ -20,8 +20,11 @@ pub trait CompositorBackend: Send + Sync {
     /// Send a command to the compositor
     async fn dispatch(&self, cmd: WmCommand) -> Result<()>;
 
-    /// Detect if this backend is available on the current system
-    fn detect() -> bool where Self: Sized;
+    /// Returns a channel that fires whenever workspace state should be refreshed.
+    /// Default impl returns None (backends that don't support event streams fall
+    /// back to the 2s poll in main.rs).
+    fn event_stream(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<()>> { None }
+
 }
 
 /// All commands Lua can trigger via woven.window.*

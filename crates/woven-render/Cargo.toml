@@ -19,3 +19,4 @@ smithay-client-toolkit = { workspace = true }
 wayland-client         = { workspace = true }
 wayland-protocols      = { workspace = true }
 wayland-protocols-wlr  = { workspace = true }
+rustix = { version = "0.38", features = ["event", "mm", "fs"] }

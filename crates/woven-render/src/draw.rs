@@ -73,21 +73,31 @@ fn read_uptime() -> u64 {
     .and_then(|v| v.parse::<f64>().ok()).map(|v| v as u64).unwrap_or(0)
 }
 fn read_cpu_pct() -> f32 {
-    let snap = || -> Option<(u64,u64)> {
+    // Non-blocking: compare against a lazily-stored previous snapshot.
+    // First call returns 0; subsequent calls return CPU% since last call.
+    use std::sync::Mutex;
+    static PREV: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+
+    let snap = || -> Option<(u64, u64)> {
         let s = std::fs::read_to_string("/proc/stat").ok()?;
         let nums: Vec<u64> = s.lines().next()?.split_whitespace().skip(1)
         .filter_map(|v| v.parse().ok()).collect();
         if nums.len() < 4 { return None; }
         Some((nums[3], nums.iter().sum()))
     };
-    if let (Some((i1,t1)), _, Some((i2,t2))) = (
-        snap(), std::thread::sleep(std::time::Duration::from_millis(25)), snap()
-    ) {
-        let dt = t2.saturating_sub(t1).max(1) as f32;
-        let di = i2.saturating_sub(i1) as f32;
-        return ((1.0 - di/dt) * 100.0).clamp(0.0, 100.0);
-    }
-    0.0
+
+    let now = snap();
+    let mut guard = PREV.lock().unwrap();
+    let result = match (*guard, now) {
+        (Some((i1, t1)), Some((i2, t2))) => {
+            let dt = t2.saturating_sub(t1).max(1) as f32;
+            let di = i2.saturating_sub(i1) as f32;
+            ((1.0 - di / dt) * 100.0).clamp(0.0, 100.0)
+        }
+        _ => 0.0,
+    };
+    *guard = now;
+    result
 }
 fn read_mem() -> (u64, u64) {
     let mut tot = 0u64; let mut avail = 0u64;
@@ -159,7 +169,7 @@ fn app_icon(class: &str) -> &'static str {
 use crossbeam_channel::Sender;
 use crate::thread::WindowAction;
 
-// ── Button hit rect ───────────────────────────────────────────────────────────
+// ── Hit rects ─────────────────────────────────────────────────────────────────
 // Stored each frame so on_press can hit-test without re-computing layout.
 
 #[derive(Clone)]
@@ -169,6 +179,21 @@ struct ButtonRect {
 }
 
 impl ButtonRect {
+    fn hit(&self, mx: f32, my: f32) -> bool {
+        mx >= self.x && mx <= self.x + self.w &&
+        my >= self.y && my <= self.y + self.h
+    }
+}
+
+/// Whole-card hit rect — clicking anywhere on the card (when NOT hovering a button)
+/// focuses the window. Buttons take priority in on_press.
+#[derive(Clone)]
+struct CardRect {
+    x: f32, y: f32, w: f32, h: f32,
+    window_id: String,
+}
+
+impl CardRect {
     fn hit(&self, mx: f32, my: f32) -> bool {
         mx >= self.x && mx <= self.x + self.w &&
         my >= self.y && my <= self.y + self.h
@@ -190,9 +215,19 @@ pub struct Painter {
     // hover & click state
     mouse_x:     f32,
     mouse_y:     f32,
-    _hover_win:  Option<String>,   // window id under cursor (reserved for future use)
-    buttons:     Vec<ButtonRect>,  // rebuilt each frame
+    _hover_win:  Option<String>,
+    buttons:     Vec<ButtonRect>,
+    cards:       Vec<CardRect>,
     action_tx:   Sender<WindowAction>,
+    // reused pixmap — avoids heap alloc + zero-fill every frame
+    pixmap:      Option<Pixmap>,
+    // set each frame from paint(anim_t) — used by draw methods for slide + fade
+    anim_alpha:  f32,
+    anim_slide:  f32,
+    // cached window thumbnails (addr → (w, h, RGBA))
+    thumbnails:  std::collections::HashMap<String, (u32, u32, Vec<u8>)>,
+    // workspace display settings
+    show_empty:  bool,
 }
 
 impl Painter {
@@ -209,15 +244,47 @@ impl Painter {
             mouse_y:    0.0,
             _hover_win:  None,
             buttons:    vec![],
+            cards:      vec![],
             action_tx,
+            pixmap:     None,
+            anim_alpha: 1.0,
+            anim_slide: 0.0,
+            thumbnails: std::collections::HashMap::new(),
+            show_empty: false,
         }
     }
 
     pub fn update_theme(&mut self, t: Theme)  { self.theme = t; }
+    pub fn update_settings(&mut self, show_empty: bool) { self.show_empty = show_empty; }
     pub fn update_state(&mut self, ws: Vec<Workspace>, met: Vec<WorkspaceMetrics>) {
-        self.workspaces = ws;
+        // Window titles may have changed — evict dynamic entries from the layout
+        // cache so stale positions don't persist. Static strings (button labels,
+        // top-bar separators) will repopulate on the next frame and stay cached.
+        self.text.clear_dynamic_cache();
+        self.workspaces = if self.show_empty {
+            ws
+        } else {
+            ws.into_iter().filter(|w| !w.windows.is_empty()).collect()
+        };
         self.metrics    = met;
     }
+
+    /// (window_addr_string, numeric_handle) for all current windows.
+    /// Handle is the address parsed from the hex string Hyprland uses.
+    pub fn window_handles(&self) -> Vec<(String, u32)> {
+        self.workspaces.iter()
+        .flat_map(|ws| &ws.windows)
+        .filter_map(|w| {
+            let h = u32::from_str_radix(w.id.trim_start_matches("0x"), 16).ok()?;
+            Some((w.id.clone(), h))
+        })
+        .collect()
+    }
+
+    pub fn update_thumbnails(&mut self, cache: std::collections::HashMap<String, (u32, u32, Vec<u8>)>) {
+        self.thumbnails = cache;
+    }
+
 
     pub fn next_page(&mut self) {
         let total_pages = ((self.workspaces.len().max(1) + 3) / 4).max(1);
@@ -239,9 +306,21 @@ impl Painter {
     pub fn on_press(&mut self, x: f64, y: f64) -> bool {
         let mx = x as f32;
         let my = y as f32;
+        // buttons take priority over card click
         for btn in &self.buttons.clone() {
             if btn.hit(mx, my) {
+                // CloseOverlay never goes through action_tx — handled directly in thread
+                if matches!(btn.action, WindowAction::CloseOverlay) {
+                    return true; // caller sets pending_hide
+                }
                 let _ = self.action_tx.try_send(btn.action.clone());
+                return true;
+            }
+        }
+        // fall back to whole-card focus
+        for card in &self.cards.clone() {
+            if card.hit(mx, my) {
+                let _ = self.action_tx.try_send(WindowAction::Focus(card.window_id.clone()));
                 return true;
             }
         }
@@ -252,10 +331,16 @@ impl Painter {
 
     // ── paint ─────────────────────────────────────────────────────────────────
 
-    pub fn paint(&mut self, width: u32, height: u32) -> Vec<u8> {
-        let mut pm = match Pixmap::new(width, height) {
-            Some(p) => p,
-            None    => {
+    pub fn paint(&mut self, width: u32, height: u32, anim_t: f32) -> Vec<u8> {
+        let needs_alloc = self.pixmap.as_ref()
+        .map(|p| p.width() != width || p.height() != height)
+        .unwrap_or(true);
+        if needs_alloc {
+            self.pixmap = Pixmap::new(width, height);
+        }
+        let mut pm = match self.pixmap.take() {
+            Some(mut p) => { p.fill(tiny_skia::Color::TRANSPARENT); p }
+            None => {
                 warn!("can't alloc {}x{}", width, height);
                 return vec![0u8; (width * height * 4) as usize];
             }
@@ -271,16 +356,38 @@ impl Painter {
         let sh = height as f32;
         let theme = self.theme.clone();
 
-        pm.fill(parse_color(&theme.background, theme.opacity));
+        // Base background — modulate opacity by anim_t so it fades in/out
+        pm.fill(parse_color(&theme.background, theme.opacity * anim_t));
 
-        // clear hit rects — rebuilt during draw_grid below
+        // Slide: content drops in from 20px above at anim_t=0, sits at 0 at anim_t=1
+        self.anim_slide = (1.0 - anim_t) * -20.0;
+        self.anim_alpha = anim_t;
+
         self.buttons.clear();
+        self.cards.clear();
 
         self.draw_top_bar(&mut pm, sw, sh);
         self.draw_grid(&mut pm, sw, sh, &theme);
         self.draw_page_indicator(&mut pm, sw, sh, &theme);
 
-        rgba_to_argb(pm.data())
+        // Global alpha: multiply every pixel's alpha by anim_t for fade in/out.
+        // This is a single pass over ~4MB at 1080p — much simpler than threading
+        // anim_alpha through every draw call.
+        if anim_t < 0.999 {
+            let a_scale = (anim_t * 255.0) as u32;
+            for px in pm.pixels_mut() {
+                let new_a = ((px.alpha() as u32 * a_scale) / 255) as u8;
+                let r = ((px.red()   as u32 * a_scale) / 255) as u8;
+                let g = ((px.green() as u32 * a_scale) / 255) as u8;
+                let b = ((px.blue()  as u32 * a_scale) / 255) as u8;
+                *px = tiny_skia::PremultipliedColorU8::from_rgba(r, g, b, new_a)
+                .unwrap_or(*px);
+            }
+        }
+
+        let result = rgba_to_argb(pm.data());
+        self.pixmap = Some(pm);
+        result
     }
 
     // ── top bar ───────────────────────────────────────────────────────────────
@@ -289,15 +396,16 @@ impl Painter {
         let theme  = self.theme.clone();
         let sys    = self.sys.clone();
         let bar_h  = TOP_H;
+        let slide  = self.anim_slide;
 
-        fill_rect(pm, 0.0, 0.0, sw, bar_h,
+        fill_rect(pm, 0.0, 0.0 + slide, sw, bar_h,
                   parse_color(&theme.background, 0.93));
-        fill_rect(pm, 0.0, bar_h - 1.0, sw, 1.0,
+        fill_rect(pm, 0.0, bar_h - 1.0 + slide, sw, 1.0,
                   parse_color(&theme.border, 0.22));
 
         let fs     = 13.0f32;
         let sm     = 11.0f32;
-        let cy     = bar_h / 2.0;
+        let cy     = bar_h / 2.0 + slide;
         let pad    = 16.0f32;
         let accent = parse_color(&theme.accent, 1.0);
         let text_c = parse_color(&theme.text,   1.0);
@@ -338,14 +446,37 @@ impl Painter {
         else if sys.cpu_pct > 50.0 { Color::from_rgba8(250,179,135,255) }
         else                        { accent };
         self.text.draw(pm, &cpu_s, rx, cy - sm/2.0, sm, cpu_c);
+
+        // ── close button (✕) ─────────────────────────────────────────────────
+        // Always visible in top-right corner — the primary way to dismiss.
+        let close_label = "  ✕  ";
+        let close_fs    = 14.0f32;
+        let close_w     = self.text.measure(close_label, close_fs) + 4.0;
+        let close_h     = bar_h * 0.65;
+        let close_x     = sw - close_w - 8.0;
+        let close_y     = bar_h / 2.0 - close_h / 2.0 + slide;
+        let mx          = self.mouse_x;
+        let my          = self.mouse_y;
+        let close_hov   = mx >= close_x && mx <= close_x + close_w
+        && my >= close_y && my <= close_y + close_h;
+        let close_bg    = Color::from_rgba8(243, 139, 168, if close_hov { 60 } else { 25 });
+        let close_fg    = Color::from_rgba8(243, 139, 168, if close_hov { 255 } else { 180 });
+        fill_rrect(pm, close_x, close_y, close_w, close_h, close_h / 2.0, close_bg);
+        self.text.draw(pm, close_label, close_x, close_y + close_h / 2.0 - close_fs / 2.0,
+                       close_fs, close_fg);
+        self.buttons.push(ButtonRect {
+            x: close_x, y: close_y, w: close_w, h: close_h,
+            action: WindowAction::CloseOverlay,
+        });
     }
 
     // ── 2×2 grid ──────────────────────────────────────────────────────────────
 
     fn draw_grid(&mut self, pm: &mut Pixmap, sw: f32, sh: f32, theme: &Theme) {
+        let slide  = self.anim_slide;
         // grid area sits below top bar and above page indicator
-        let grid_top = TOP_H + GRID_PAD;
-        let grid_bot = sh - PAGE_IND - GRID_PAD;
+        let grid_top = TOP_H + GRID_PAD + slide;
+        let grid_bot = sh - PAGE_IND - GRID_PAD + slide;
         let grid_h   = (grid_bot - grid_top).max(10.0);
         let grid_w   = sw - GRID_PAD * 2.0;
 
@@ -546,6 +677,7 @@ impl Painter {
         let my      = self.mouse_y;
 
         let mut new_buttons: Vec<ButtonRect> = Vec::new();
+        let mut new_cards:   Vec<CardRect>   = Vec::new();
 
         for win in &ws.windows.clone() {
             if wy + win_h > max_y { break; }
@@ -554,6 +686,9 @@ impl Painter {
             let ww   = cw - pad * 2.0;
             let cls  = class_color(&win.class);
             let id   = win.id.clone();
+
+            // register whole-card rect for click-to-focus
+            new_cards.push(CardRect { x: wx, y: wy, w: ww, h: win_h, window_id: id.clone() });
 
             // is mouse hovering this card?
             let hovered = mx >= wx && mx <= wx + ww && my >= wy && my <= wy + win_h;
@@ -569,27 +704,43 @@ impl Painter {
             // left color strip
             fill_rrect(pm, wx, wy, 3.0, win_h, 1.5, cls);
 
-            // icon circle
+            // icon / thumbnail area
             let icon_r  = (win_h * 0.28).max(6.0);
             let icon_cx = wx + pad/2.0 + icon_r + 2.0;
             let icon_cy = wy + win_h / 2.0;
-            fill_circle(pm, icon_cx, icon_cy, icon_r, with_alpha(cls, 0.20));
 
-            let icon_str = app_icon(&win.class);
-            let icon_fs  = (icon_r * 1.4).max(8.0);
-            let icon_mw  = self.text.measure(icon_str, icon_fs);
-            let (draw_str, draw_fs) = if icon_mw > 2.0 {
-                (icon_str.to_string(), icon_fs)
+            // Try to draw a scaled thumbnail; fall back to icon circle
+            let thumb_drawn = if let Some((tw, th, rgba)) = self.thumbnails.get(&win.id) {
+                let tw = *tw; let th = *th;
+                // fit thumbnail into a small box left of the text
+                let box_h = (win_h - 4.0).max(4.0);
+                let box_w = (box_h * tw as f32 / th.max(1) as f32).min(icon_r * 2.0 + 4.0);
+                let bx = icon_cx - box_w / 2.0;
+                let by = wy + 2.0;
+                draw_thumbnail(pm, rgba, tw, th, bx, by, box_w, box_h);
+                true
             } else {
-                let l = win.class.chars().find(|c| c.is_alphabetic())
-                .map(|c| c.to_uppercase().to_string()).unwrap_or("?".into());
-                (l, icon_fs * 0.85)
+                false
             };
-            let dw = self.text.measure(&draw_str, draw_fs);
-            self.text.draw(pm, &draw_str,
-                           icon_cx - dw / 2.0,
-                           icon_cy - draw_fs / 2.0 - draw_fs * 0.12,
-                           draw_fs, cls);
+
+            if !thumb_drawn {
+                fill_circle(pm, icon_cx, icon_cy, icon_r, with_alpha(cls, 0.20));
+                let icon_str = app_icon(&win.class);
+                let icon_fs  = (icon_r * 1.4).max(8.0);
+                let icon_mw  = self.text.measure(icon_str, icon_fs);
+                let (draw_str, draw_fs) = if icon_mw > 2.0 {
+                    (icon_str.to_string(), icon_fs)
+                } else {
+                    let l = win.class.chars().find(|c| c.is_alphabetic())
+                    .map(|c| c.to_uppercase().to_string()).unwrap_or("?".into());
+                    (l, icon_fs * 0.85)
+                };
+                let dw = self.text.measure(&draw_str, draw_fs);
+                self.text.draw(pm, &draw_str,
+                               icon_cx - dw / 2.0,
+                               icon_cy - draw_fs / 2.0 - draw_fs * 0.12,
+                               draw_fs, cls);
+            }
 
             // app name + title (hide when hovering to make room for buttons)
             if !hovered {
@@ -650,8 +801,9 @@ impl Painter {
             wy += win_h + win_gap;
         }
 
-        // push buttons collected this frame
+        // push hit rects collected this frame
         self.buttons.extend(new_buttons);
+        self.cards.extend(new_cards);
 
         // overflow label
         let shown = ((max_y - (cy + hdr_h + win_gap)) / (win_h + win_gap)) as usize;
@@ -785,4 +937,44 @@ fn rgba_to_argb(rgba: &[u8]) -> Vec<u8> {
         out.push(px[2]); out.push(px[1]); out.push(px[0]); out.push(px[3]);
     }
     out
+}
+
+/// Blit a scaled RGBA thumbnail into a (bx,by,bw,bh) box using nearest-neighbour.
+/// Clips to pixmap bounds — safe to call with any coordinates.
+fn draw_thumbnail(pm: &mut Pixmap, src: &[u8], sw: u32, sh: u32,
+                  bx: f32, by: f32, bw: f32, bh: f32)
+{
+    if sw == 0 || sh == 0 || bw < 1.0 || bh < 1.0 { return; }
+    let pw = pm.width()  as i32;
+    let ph = pm.height() as i32;
+    let bw = bw as i32;
+    let bh = bh as i32;
+    let ox = bx as i32;
+    let oy = by as i32;
+
+    let pixels = pm.pixels_mut();
+    for dy in 0..bh {
+        let py = oy + dy;
+        if py < 0 || py >= ph { continue; }
+        for dx in 0..bw {
+            let px = ox + dx;
+            if px < 0 || px >= pw { continue; }
+
+            // nearest source pixel
+            let sx = (dx as f32 / bw as f32 * sw as f32) as u32;
+            let sy = (dy as f32 / bh as f32 * sh as f32) as u32;
+            let si = ((sy * sw + sx) * 4) as usize;
+            if si + 3 >= src.len() { continue; }
+
+            let r = src[si];
+            let g = src[si+1];
+            let b = src[si+2];
+            // premultiply alpha=255 → straight copy
+            let di = (py * pw + px) as usize;
+            if di < pixels.len() {
+                pixels[di] = tiny_skia::PremultipliedColorU8::from_rgba(r, g, b, 255)
+                .unwrap_or(pixels[di]);
+            }
+        }
+    }
 }

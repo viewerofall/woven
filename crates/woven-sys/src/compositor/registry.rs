@@ -12,10 +12,8 @@ use tracing::info;
 
 use super::backend::CompositorBackend;
 use super::hyprland::HyprlandBackend;
-// Add new backends here:
-// use super::sway::SwayBackend;
-// use super::niri::NiriBackend;
-// use super::kwin::KWinBackend;
+use super::niri::NiriBackend;
+use super::sway::SwayBackend;
 
 /// Try each registered backend in order, return the first that detects.
 pub fn detect_backend() -> Result<Arc<dyn CompositorBackend>> {
@@ -31,17 +29,16 @@ pub fn detect_backend() -> Result<Arc<dyn CompositorBackend>> {
          HyprlandBackend::detect(),
          Box::new(|| Ok(Arc::new(HyprlandBackend::new()?) as Arc<dyn CompositorBackend>)),
         ),
-        // Uncomment when implemented:
-        // (
-        //     "niri",
-        //     NiriBackend::detect(),
-        //     Box::new(|| Ok(Arc::new(NiriBackend::new()?) as Arc<dyn CompositorBackend>)),
-        // ),
-        // (
-        //     "sway",
-        //     SwayBackend::detect(),
-        //     Box::new(|| Ok(Arc::new(SwayBackend::new()?) as Arc<dyn CompositorBackend>)),
-        // ),
+        (
+            "niri",
+         NiriBackend::detect(),
+         Box::new(|| Ok(Arc::new(NiriBackend::new()?) as Arc<dyn CompositorBackend>)),
+        ),
+        (
+            "sway",
+         SwayBackend::detect(),
+         Box::new(|| Ok(Arc::new(SwayBackend::new()?) as Arc<dyn CompositorBackend>)),
+        ),
     ];
 
     for (name, detected, constructor) in backends {
@@ -53,9 +50,8 @@ pub fn detect_backend() -> Result<Arc<dyn CompositorBackend>> {
 
     bail!(
         "No supported compositor detected.\n\
-Currently supported: Hyprland\n\
-Coming soon: Niri, Sway, KWin\n\
+Currently supported: Hyprland, Niri, Sway\n\
 To add support for your compositor, implement CompositorBackend\n\
-in crates/woven-sys/src/compositor/<name>.rs and register it in registry.rs"
+in crates/woven-sys/src/compositor/<n>.rs and register it in registry.rs"
     )
 }

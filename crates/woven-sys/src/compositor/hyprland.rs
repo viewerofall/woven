@@ -26,6 +26,10 @@ impl HyprlandBackend {
         Ok(Self { socket_path })
     }
 
+    pub fn detect() -> bool {
+        env::var("HYPRLAND_INSTANCE_SIGNATURE").is_ok()
+    }
+
     /// Send a raw command to Hyprland socket, get response string
     async fn send(&self, cmd: &str) -> Result<String> {
         let mut stream = UnixStream::connect(&self.socket_path)
@@ -44,6 +48,53 @@ impl HyprlandBackend {
         Ok(serde_json::from_str(&raw)?)
     }
 
+    /// Connect to socket2 (event stream) and return a receiver that fires on
+    /// any event that requires a workspace state refresh.
+    pub fn event_stream(&self) -> tokio::sync::mpsc::UnboundedReceiver<()> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let sig  = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").unwrap_or_default();
+        let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+        let path = format!("{}/hypr/{}/.socket2.sock", base, sig);
+
+        tokio::spawn(async move {
+            loop {
+                match UnixStream::connect(&path).await {
+                    Err(e) => {
+                        warn!("socket2 connect failed: {e} — retrying in 2s");
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    }
+                    Ok(mut stream) => {
+                        let mut buf = vec![0u8; 4096];
+                        loop {
+                            match stream.read(&mut buf).await {
+                                Ok(0) | Err(_) => break, // reconnect
+                     Ok(n) => {
+                         let data = std::str::from_utf8(&buf[..n]).unwrap_or("");
+                         // fire on events that change workspace/window state
+                         let relevant = data.lines().any(|line| {
+                             let ev = line.split(">>").next().unwrap_or("");
+                             matches!(ev,
+                                      "openwindow" | "closewindow" | "movewindow" |
+                                      "workspace"  | "createworkspace" | "destroyworkspace" |
+                                      "fullscreen" | "togglefloating" | "pin" |
+                                      "activewindow" | "movewindowtoworkspace"
+                             )
+                         });
+                         if relevant {
+                             let _ = tx.send(());
+                         }
+                     }
+                            }
+                        }
+                        warn!("socket2 stream ended — reconnecting");
+                    }
+                }
+            }
+        });
+
+        rx
+    }
+
     /// j/clients returns JSON array of window objects
     async fn fetch_clients_raw(&self) -> Result<serde_json::Value> {
         let raw = self.send("j/clients").await?;
@@ -55,8 +106,8 @@ impl HyprlandBackend {
 impl CompositorBackend for HyprlandBackend {
     fn name(&self) -> &'static str { "hyprland" }
 
-    fn detect() -> bool {
-        env::var("HYPRLAND_INSTANCE_SIGNATURE").is_ok()
+    fn event_stream(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<()>> {
+        Some(HyprlandBackend::event_stream(self))
     }
 
     async fn workspaces(&self) -> Result<Vec<Workspace>> {

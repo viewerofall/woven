@@ -108,8 +108,10 @@ pub fn bind(lua: &Lua, state: Arc<AppState>) -> anyhow::Result<()> {
     bind_window(lua, &woven, state.clone())?;
     bind_metrics(lua, &woven, state.clone())?;
     bind_overlay(lua, &woven, state.clone())?;
+    bind_workspaces_api(lua, &woven, state.clone())?;
     bind_guide(lua, &woven)?;
     bind_log(lua, &woven)?;
+    bind_process(lua, &woven)?;
     bind_config_api(lua, &woven, state.clone())?;
 
     // safe require — only resolves from runtime/ and config dir
@@ -348,6 +350,18 @@ fn bind_overlay(lua: &Lua, woven: &LuaTable, state: Arc<AppState>) -> LuaResult<
     Ok(())
 }
 
+fn bind_workspaces_api(lua: &Lua, woven: &LuaTable, state: Arc<AppState>) -> LuaResult<()> {
+    let render = state.render.clone();
+    // woven.workspaces({ show_empty = bool }) — called from user config
+    let set_workspaces = lua.create_function(move |_, t: LuaTable| {
+        let show_empty = t.get::<bool>("show_empty").unwrap_or(false);
+        render.send(RenderCmd::UpdateSettings { show_empty });
+        Ok(())
+    })?;
+    woven.set("workspaces", set_workspaces)?;
+    Ok(())
+}
+
 fn bind_guide(lua: &Lua, woven: &LuaTable) -> LuaResult<()> {
     let guide    = lua.create_table()?;
     let print_fn = lua.create_function(|_, msg: String| {
@@ -377,6 +391,32 @@ fn bind_log(lua: &Lua, woven: &LuaTable) -> LuaResult<()> {
     log.set("warn",  warn)?;
     log.set("error", error)?;
     woven.set("log", log)?;
+    Ok(())
+}
+
+fn bind_process(lua: &Lua, woven: &LuaTable) -> LuaResult<()> {
+    let proc  = lua.create_table()?;
+
+    // woven.process.spawn("woven-ctrl", {"--setup"})
+    let spawn = lua.create_function(|_, (prog, args): (String, Vec<String>)| {
+        std::process::Command::new(&prog)
+            .args(&args)
+            .spawn()
+            .map_err(|e| mlua::Error::external(
+                format!("process.spawn({}): {}", prog, e)
+            ))?;
+        Ok(())
+    })?;
+
+    // woven.process.sleep(ms) — blocks the Lua VM thread, not the render thread
+    let sleep = lua.create_function(|_, ms: u64| {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+        Ok(())
+    })?;
+
+    proc.set("spawn", spawn)?;
+    proc.set("sleep", sleep)?;
+    woven.set("process", proc)?;
     Ok(())
 }
 

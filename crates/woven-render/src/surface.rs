@@ -69,7 +69,7 @@ impl LayerSurface {
         );
         layer_surface.set_anchor(Anchor::all());
         layer_surface.set_exclusive_zone(-1);
-        layer_surface.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
+        layer_surface.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
         layer_surface.set_size(0, 0);
         layer_surface.commit();
 
@@ -91,48 +91,121 @@ impl LayerSurface {
             width:        0,
             height:       0,
             configured:   false,
+            visible:      false,
         };
 
         Ok(Self { queue, state })
     }
 
     pub fn show(&mut self) -> Result<()> {
-        // Re-request configuration from compositor so surface gets a real size.
-        // Don't commit here — present() will do that with a real buffer.
-        self.state.configured = false;
-        self.state.layer_surface.set_size(0, 0);
-        self.state.layer_surface.set_keyboard_interactivity(
-            smithay_client_toolkit::shell::wlr_layer::KeyboardInteractivity::OnDemand
-        );
-        self.state.layer_surface.wl_surface().commit();
+        self.state.visible = true;
+        if self.state.width == 0 {
+            // First ever show — need to pump until compositor sends us a configure
+            // with our actual screen dimensions.
+            self.state.configured = false;
+            self.state.layer_surface.set_size(0, 0);
+            self.state.layer_surface.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+            self.state.layer_surface.commit();   // SCT-tracked commit, safe
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            while !self.state.configured && std::time::Instant::now() < deadline {
+                let _ = self.queue.flush();
+                if let Some(guard) = self.queue.prepare_read() { let _ = guard.read(); }
+                let _ = self.queue.dispatch_pending(&mut self.state);
+            }
+            if !self.state.configured {
+                tracing::warn!("compositor never sent configure — overlay may not display");
+            }
+        } else {
+            // Re-show after hide: reattach by committing with keyboard interactivity,
+            // then pump for the configure Niri sends in response to attach(None) being
+            // reversed by our first present(). Set configured=false so present() only
+            // fires after the compositor acks us.
+            self.state.configured = false;
+            self.state.layer_surface.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+            self.state.layer_surface.commit();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            while !self.state.configured && std::time::Instant::now() < deadline {
+                let _ = self.queue.flush();
+                if let Some(guard) = self.queue.prepare_read() { let _ = guard.read(); }
+                let _ = self.queue.dispatch_pending(&mut self.state);
+            }
+            if !self.state.configured {
+                // Niri didn't re-configure — just proceed, present() will commit
+                self.state.configured = true;
+            }
+        }
         Ok(())
     }
 
     pub fn hide(&mut self) -> Result<()> {
-        // Detach buffer — this makes the surface invisible without destroying it.
+        self.state.visible    = false;
         self.state.configured = false;
-        self.state.layer_surface.wl_surface().attach(None, 0, 0);
-        self.state.layer_surface.wl_surface().commit();
+        // Detach the buffer so Niri actually removes the surface from the display.
+        // Without this, Niri keeps rendering the last frame forever since we never
+        // told it to stop. attach(None) + commit is the correct Wayland hide idiom.
+        let surf = self.state.layer_surface.wl_surface();
+        surf.attach(None, 0, 0);
+        surf.commit();
+        let _ = self.queue.flush();
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            tracing::info!("display: hidden");
+        });
         Ok(())
     }
+
+    /// Drop keyboard interactivity — applied on next present() commit.
+    pub fn release_input(&mut self) {
+        self.state.layer_surface
+        .set_keyboard_interactivity(KeyboardInteractivity::None);
+        self.state.layer_surface.commit(); // must commit or compositor never sees it
+    }
+
+    /// Grab exclusive input so the overlay receives all pointer + keyboard
+    /// events immediately without requiring a click to focus first.
+    pub fn grab_input(&mut self) {
+        self.state.layer_surface
+        .set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+        self.state.layer_surface.commit();
+    }
+
+    pub fn is_visible(&self) -> bool { self.state.visible }
 
     pub fn size(&self) -> (u32, u32) {
         (self.state.width, self.state.height)
     }
 
     pub fn dispatch(&mut self) -> Result<()> {
+        // Flush outgoing events first
         if let Err(e) = self.queue.flush() {
             tracing::debug!("wayland flush skipped: {}", e);
         }
+
+        // Non-blocking read: only consume events already in the socket buffer.
+        // We poll the Wayland fd with timeout=0 so we never stall the render loop
+        // waiting for the compositor to send something.
         if let Some(guard) = self.queue.prepare_read() {
-            let _ = guard.read();
+            use std::os::unix::io::AsRawFd;
+            use rustix::fd::AsFd;
+            use rustix::event::{PollFd, PollFlags, poll};
+            let raw = self.queue.as_fd().as_raw_fd();
+            let borrowed = unsafe { rustix::fd::BorrowedFd::borrow_raw(raw) };
+            let mut pfd = PollFd::new(&borrowed, PollFlags::IN);
+            let ready = poll(std::slice::from_mut(&mut pfd), 0).unwrap_or(0);
+            if ready > 0 && pfd.revents().contains(PollFlags::IN) {
+                let _ = guard.read();
+            } else {
+                drop(guard);
+            }
         }
+
         self.queue.dispatch_pending(&mut self.state).context("dispatch failed")?;
         Ok(())
     }
 
     pub fn present(&mut self, pixels: Vec<u8>, width: u32, height: u32) -> Result<()> {
-        if !self.state.configured { return Ok(()); }
+        if !self.state.configured || !self.state.visible { return Ok(()); }
         let stride = width * 4;
         let (buffer, canvas) = self.state.pool
         .create_buffer(width as i32, height as i32, stride as i32, wl_shm::Format::Argb8888)
@@ -165,6 +238,7 @@ struct WovenState {
     width:        u32,
     height:       u32,
     configured:   bool,
+    visible:      bool,
 }
 
 impl CompositorHandler for WovenState {
@@ -255,12 +329,16 @@ impl PointerHandler for WovenState {
     {
         for ev in events {
             match ev.kind {
-                // Enter event: THIS is the right time to set the cursor
-                // The compositor gives us a valid serial here
+                // Enter: set cursor AND send initial position so hover works immediately
                 PointerEventKind::Enter { .. } => {
                     if let Some(ptr) = &self.pointer {
                         let _ = ptr.set_cursor(conn, CursorIcon::Default);
                     }
+                    self.mouse_x = ev.position.0;
+                    self.mouse_y = ev.position.1;
+                    let _ = self.mouse_tx.try_send(MouseEvent::Motion {
+                        x: self.mouse_x, y: self.mouse_y,
+                    });
                 }
                 PointerEventKind::Motion { time: _ } => {
                     self.mouse_x = ev.position.0;
@@ -301,12 +379,16 @@ impl PointerHandler for WovenState {
 impl LayerShellHandler for WovenState {
     fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &SctLayerSurface) {}
     fn configure(&mut self, _: &Connection, _: &QueueHandle<Self>,
-                 _: &SctLayerSurface, cfg: LayerSurfaceConfigure, _: u32)
+                 _: &SctLayerSurface, cfg: LayerSurfaceConfigure, _serial: u32)
     {
-        self.width      = cfg.new_size.0;
-        self.height     = cfg.new_size.1;
-        self.configured = true;
-        info!("surface configured: {}x{}", self.width, self.height);
+        self.width          = cfg.new_size.0;
+        self.height         = cfg.new_size.1;
+        self.configured     = true;
+        let (w, h) = (self.width, self.height);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            tracing::info!("surface configured: {}x{}", w, h);
+        });
     }
 }
 

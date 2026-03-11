@@ -1,4 +1,4 @@
-//! Dual-font text renderer.
+//! Dual-font text renderer with glyph rasterization cache.
 //! Font 0 = regular text (DejaVu / Liberation / system sans)
 //! Font 1 = Nerd Font for icons (JetBrainsMono NF, FiraCode NF, etc.)
 //!
@@ -7,12 +7,38 @@
 //! it uses the icon font. Everything else uses the text font.
 
 use fontdue::{Font, FontSettings, layout::{CoordinateSystem, Layout, TextStyle}};
+use std::collections::HashMap;
 use tiny_skia::{Color, Pixmap};
 
+/// Key for the glyph cache: (font_index, codepoint, size_in_tenth_pixels)
+/// Size is quantized to 0.5px steps to avoid unbounded cache growth.
+#[derive(Hash, PartialEq, Eq, Clone)]
+struct GlyphKey(u8, char, u16);
+
+struct CachedGlyph {
+    width:   usize,
+    height:  usize,
+    bitmap:  Vec<u8>,
+}
+
+/// Key for the measure cache: string content + quantized size.
+/// Using a Box<str> avoids storing the full String overhead.
+#[derive(Hash, PartialEq, Eq, Clone)]
+struct MeasureKey(Box<str>, u16);
+
+/// Cached result of a layout pass: per-glyph (GlyphKey, rel_x, rel_y) + total advance.
+struct LayoutEntry {
+    glyphs:  Vec<(GlyphKey, f32, f32)>,
+    advance: f32,
+}
+
 pub struct TextRenderer {
-    fonts:  Vec<Font>,  // [0] = text, [1] = icons (may be same as [0] if NF not found)
-    layout: Layout,
-    has_nerd_font: bool,
+    fonts:          Vec<Font>,
+    layout:         Layout,
+    has_nerd_font:  bool,
+    glyph_cache:    HashMap<GlyphKey, CachedGlyph>,
+    measure_cache:  HashMap<MeasureKey, f32>,
+    layout_cache:   HashMap<MeasureKey, LayoutEntry>,
 }
 
 impl TextRenderer {
@@ -65,6 +91,9 @@ Install ttf-jetbrains-mono-nerd (CachyOS: sudo pacman -S ttf-jetbrains-mono-nerd
             fonts,
             layout: Layout::new(CoordinateSystem::PositiveYDown),
             has_nerd_font,
+            glyph_cache:   HashMap::with_capacity(512),
+            measure_cache: HashMap::with_capacity(256),
+            layout_cache:  HashMap::with_capacity(256),
         }
     }
 
@@ -88,68 +117,93 @@ Install ttf-jetbrains-mono-nerd (CachyOS: sudo pacman -S ttf-jetbrains-mono-nerd
 
         let pw = pixmap.width()  as i32;
         let ph = pixmap.height() as i32;
+        let size_key = (size * 2.0).round() as u16;
+        let lkey = MeasureKey(text.into(), size_key);
 
-        // Split into runs: icon codepoints vs text codepoints
-        // Draw each run with the appropriate font
-        let mut advance = 0.0f32;
-        for (run_text, font_idx) in split_runs(text, self.has_nerd_font) {
-            let fi = font_idx.min(self.fonts.len() - 1);
-
-            self.layout.reset(&Default::default());
-            self.layout.append(
-                &self.fonts.iter().collect::<Vec<_>>(),
-                               &TextStyle::new(&run_text, size, fi),
-            );
-
-            let pixels = pixmap.pixels_mut();
-            for glyph in self.layout.glyphs() {
-                let fi_actual = glyph.font_index.min(self.fonts.len() - 1);
-                let (metrics, bitmap) = self.fonts[fi_actual].rasterize(glyph.parent, size);
-                if metrics.width == 0 || metrics.height == 0 { continue; }
-
-                let gx = (x + advance + glyph.x).round() as i32;
-                let gy = (y + glyph.y).round() as i32;
-
-                for row in 0..metrics.height {
-                    for col in 0..metrics.width {
-                        let px = gx + col as i32;
-                        let py = gy + row as i32;
-                        if px < 0 || py < 0 || px >= pw || py >= ph { continue; }
-
-                        let coverage = bitmap[row * metrics.width + col];
-                        if coverage == 0 { continue; }
-
-                        let idx   = (py * pw + px) as usize;
-                        let dst   = &mut pixels[idx];
-                        let src_a = (coverage as u16 * a as u16) / 255;
-                        let inv_a = 255u16.saturating_sub(src_a);
-
-                        let dr = ((r as u16 * src_a + dst.red()   as u16 * inv_a) / 255) as u8;
-                        let dg = ((g as u16 * src_a + dst.green() as u16 * inv_a) / 255) as u8;
-                        let db = ((b as u16 * src_a + dst.blue()  as u16 * inv_a) / 255) as u8;
-                        let da = src_a.saturating_add(dst.alpha() as u16 * inv_a / 255) as u8;
-
-                        *dst = tiny_skia::PremultipliedColorU8::from_rgba(dr, dg, db, da)
-                        .unwrap_or(*dst);
-                    }
+        // ── layout pass (cached) ──────────────────────────────────────────────
+        // Fontdue Layout::append is expensive — cache per (text, size) so it
+        // only runs once. After warm-up this branch is never taken.
+        if !self.layout_cache.contains_key(&lkey) {
+            let mut entry = LayoutEntry { glyphs: Vec::new(), advance: 0.0 };
+            let fonts_ref: Vec<&Font> = self.fonts.iter().collect();
+            let has_nf = self.has_nerd_font;
+            for_each_run(text, has_nf, |run_text, font_idx| {
+                let fi = font_idx.min(fonts_ref.len() - 1);
+                self.layout.reset(&Default::default());
+                self.layout.append(&fonts_ref, &TextStyle::new(run_text, size, fi));
+                let base = entry.advance;
+                for gl in self.layout.glyphs() {
+                    let fi_a = gl.font_index.min(fonts_ref.len() - 1);
+                    entry.glyphs.push((GlyphKey(fi_a as u8, gl.parent, size_key), base + gl.x, gl.y));
                 }
+                let run_w = self.layout.glyphs().iter()
+                .map(|g| g.x + g.width as f32).fold(0.0f32, f32::max);
+                entry.advance += run_w;
+            });
+            self.layout_cache.insert(lkey.clone(), entry);
+        }
 
+        // ── blit pass ─────────────────────────────────────────────────────────
+        // Clone the glyph list to avoid holding a reference into layout_cache
+        // while we mutate glyph_cache below.
+        let (gl_list, advance) = {
+            let e = &self.layout_cache[&lkey];
+            (e.glyphs.clone(), e.advance)
+        };
+
+        let pixels = pixmap.pixels_mut();
+        for (gk, rel_x, rel_y) in &gl_list {
+            let cached = self.glyph_cache.entry(gk.clone()).or_insert_with(|| {
+                let fi = gk.0 as usize;
+                let (metrics, bitmap) = self.fonts[fi].rasterize(gk.1, size);
+                CachedGlyph { width: metrics.width, height: metrics.height, bitmap }
+            });
+            if cached.width == 0 || cached.height == 0 { continue; }
+
+            let gx = (x + rel_x).round() as i32;
+            let gy = (y + rel_y).round() as i32;
+
+            for row in 0..cached.height {
+                for col in 0..cached.width {
+                    let px = gx + col as i32;
+                    let py = gy + row as i32;
+                    if px < 0 || py < 0 || px >= pw || py >= ph { continue; }
+                    let coverage = cached.bitmap[row * cached.width + col];
+                    if coverage == 0 { continue; }
+                    let idx   = (py * pw + px) as usize;
+                    let dst   = &mut pixels[idx];
+                    let src_a = (coverage as u16 * a as u16) / 255;
+                    let inv_a = 255u16.saturating_sub(src_a);
+                    let dr = ((r as u16 * src_a + dst.red()   as u16 * inv_a) / 255) as u8;
+                    let dg = ((g as u16 * src_a + dst.green() as u16 * inv_a) / 255) as u8;
+                    let db = ((b as u16 * src_a + dst.blue()  as u16 * inv_a) / 255) as u8;
+                    let da = src_a.saturating_add(dst.alpha() as u16 * inv_a / 255) as u8;
+                    *dst = tiny_skia::PremultipliedColorU8::from_rgba(dr, dg, db, da)
+                    .unwrap_or(*dst);
+                }
             }
-            // advance by this run's rightmost glyph edge only — don't double count
-            let run_w = self.layout.glyphs().iter()
-            .map(|g| g.x + g.width as f32)
-            .fold(0.0f32, f32::max);
-            advance += run_w;
         }
 
         advance
     }
 
+    /// Clear layout + measure caches. Call when text content may have changed
+    /// (e.g. window titles updated). Glyph bitmaps are unaffected.
+    pub fn clear_dynamic_cache(&mut self) {
+        self.layout_cache.clear();
+        self.measure_cache.clear();
+    }
+
     /// Measure text width without drawing
     pub fn measure(&mut self, text: &str, size: f32) -> f32 {
         if text.is_empty() || size < 1.0 { return 0.0; }
+        let size_key = (size * 2.0).round() as u16;
+        let key = MeasureKey(text.into(), size_key);
+        if let Some(&cached) = self.measure_cache.get(&key) {
+            return cached;
+        }
         let mut total = 0.0f32;
-        for (run_text, font_idx) in split_runs(text, self.has_nerd_font) {
+        for_each_run(text, self.has_nerd_font, |run_text, font_idx| {
             let fi = font_idx.min(self.fonts.len() - 1);
             self.layout.reset(&Default::default());
             self.layout.append(
@@ -160,37 +214,40 @@ Install ttf-jetbrains-mono-nerd (CachyOS: sudo pacman -S ttf-jetbrains-mono-nerd
             .map(|g| g.x + g.width as f32)
             .fold(0.0f32, f32::max);
             total += w;
-        }
+        });
+        self.measure_cache.insert(key, total);
         total
     }
 }
 
-/// Split text into (run_string, font_index) pairs.
-/// font_index 1 = icon font (NF private use area), 0 = text font.
-fn split_runs(text: &str, has_nerd_font: bool) -> Vec<(String, usize)> {
+/// Iterate font runs without allocating. Calls `f(run_str, font_idx)` for each run.
+fn for_each_run(text: &str, has_nerd_font: bool, mut f: impl FnMut(&str, usize)) {
     if !has_nerd_font {
-        return vec![(text.to_string(), 0)];
+        f(text, 0);
+        return;
     }
-    let mut runs: Vec<(String, usize)> = Vec::new();
-    let mut current = String::new();
-    let mut current_fi: usize = 0;
+    // Find run boundaries by scanning for font-index changes, then slice the
+    // original str — no String allocation needed.
+    let mut run_start     = 0usize;
+    let mut run_fi        = 0usize;
+    let mut first_char    = true;
 
-    for ch in text.chars() {
+    for (byte_pos, ch) in text.char_indices() {
         let fi = if is_icon_codepoint(ch) { 1 } else { 0 };
-        if fi != current_fi && !current.is_empty() {
-            runs.push((current.clone(), current_fi));
-            current.clear();
+        if first_char {
+            run_fi    = fi;
+            first_char = false;
+        } else if fi != run_fi {
+            f(&text[run_start..byte_pos], run_fi);
+            run_start = byte_pos;
+            run_fi    = fi;
         }
-        current_fi = fi;
-        current.push(ch);
     }
-    if !current.is_empty() {
-        runs.push((current, current_fi));
+    if !first_char {
+        f(&text[run_start..], run_fi);
+    } else {
+        f(text, 0);
     }
-    if runs.is_empty() {
-        runs.push((text.to_string(), 0));
-    }
-    runs
 }
 
 fn is_icon_codepoint(ch: char) -> bool {
