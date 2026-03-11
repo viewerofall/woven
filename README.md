@@ -1,53 +1,192 @@
-# 🕸️ Woven
+# woven
 
-![Hyprland Required](https://img.shields.io/badge/Hyprland-Required-00adff?style=flat-square&logo=hyprland&logoColor=white)
-![Status: Work in Progress](https://img.shields.io/badge/Status-Work_in_Progress-orange)
-![Status](https://img.shields.io/badge/Status-Due%20to%20Change-orange?style=flat-square)
-![Platform: Wayland | X11](https://img.shields.io/badge/Platform-Wayland%20%7C%20X11-blue)
-![Language: Rust | Lua](https://img.shields.io/badge/Language-Rust%20%7C%20Lua-red)
+A Wayland workspace overview daemon. Press a key, see all your workspaces and windows at once, click to focus.
 
-**Woven** is an up-and-coming, highly customizable central overlay for window managers. Built primarily for **Wayland** (with portable **X11** support), Woven gives you a new version of niri's overlay system  
-
-Whether you are a power user needing to find something and manage your usage or a rice enthusiast looking for the perfect niri overlay replacement, Woven acts as a user-friendly tool that will help assist you, and talor it to your needs with the declarative file that we have a program to edit with just to make it nicer to newbies.
+```
+Super+` → overlay appears → click a window → overlay closes, window focused
+```
 
 ---
 
-## ✨ Core Features
+## Supported compositors
 
-* **The Bird's Eye View:** Summons a sleek, centralized overlay over your current window manager, providing instant access to everything happening on your machine.
-* **Deep System Monitoring:** See total processing power, memory usage, and system thermals at a glance.
-* **Per-Program Telemetry:** Break down your resource usage program-by-program to see exactly what is eating your CPU or battery.
-* **Wayland First, X11 Friendly:** Designed from the ground up to play nicely with modern Wayland compositors (Hyprland, Sway, etc.) while maintaining backward compatibility with X11 setups.
+| Compositor | Status |
+|------------|--------|
+| Hyprland   | ✅ Full support |
+| Niri       | ✅ Full support |
+| Sway       | ⚠️ Implemented, untested |
 
-## 🏗️ Architecture & Tech Stack
+GNOME is not supported — it does not implement `wlr-layer-shell`.
+KDE is coming in v2.5/3 and will not be meant for daily use due to the fact it does not use the same system as window managers
 
-Woven is built for blazing speed and ultimate flexibility by splitting its responsibilities:
+---
 
-* **The Engine (Rust):** The heavy lifting—system monitoring, window drawing, and process management—is written entirely in Rust for memory safety, low overhead, and maximum performance.
-* **The Blueprint (Lua):** Woven is configured and guided entirely via **Lua**. Lua acts as the declarative core, allowing you to script, theme, and mold the overlay exactly to your liking without needing to recompile the project.
-* **The Manager (Tool):** A standalone management program handles the Woven lua configuration, allowing you to change it whenever you like and with nice prompts and settings buttons for easy control and management with it. Allows themeing and customizing the logos and style used in it.
+## Install
 
-## 🚀 Roadmap (Coming Soon)
+### From source
 
-Woven is currently in early development. Here is what we are working on:
+```bash
+This is for later, I will update and add the rules needed for it
+```
 
-- [ ] **Core Daemon:** Establish Rust backend for basic overlay rendering.
-- [ ] **Process Monitoring:** Implement real-time CPU/RAM polling per program.
-- [ ] **Seperate program to overview:** Make a different program to manage it, keeping the controller and management only tied by the single lua file 
-- [ ] **Wayland/X11 Compositing:** Ensure seamless transparency and blur effects across different display servers.
-- [ ] **Full GUI Configuration Tool:** A complete, user-friendly graphical interface to install, set up, and configure Woven without ever touching a config file (for those who prefer a GUI over code).
-- [ ] **Plugin Ecosystem:** Allow community-made widgets to be injected into the overlay.
+`install.sh` copies everything over and runs the daemon, implementing automatic detection of desktop environments soon 
 
-## 🛠️ Getting Started (Placeholder)
+### Manual
 
-> **Note:** Woven is currently a placeholder/WIP. The only provided file is the current code of it. This is mainly an emergency backup for **MY** use and may not work on other systems 
+```bash
+Later, maybe tomorrow, maybe later today who knows
+```
 
-### Prerequisites
-* `rustc` and `cargo` (latest stable)
-* `lua5.1` or `luajit`
-* Wayland compositor (e.g., Hyprland) or X11 Window Manager
-* Hyprland
+---
 
-### Installation
-**NOT** Releasable currently
-Services and other things arent currently released with the compressed package, buisness releases for the future
+## First-time setup
+
+On first launch, if no config exists, `woven` opens `woven-ctrl --setup` — a graphical wizard that handles compositor detection, color theme selection, and keybind instructions. No terminal interaction required.
+
+---
+
+## Compositor setup
+
+### Hyprland
+
+```ini
+exec-once = woven
+bind = SUPER, grave, exec, woven-ctrl --toggle
+```
+
+### Niri
+
+```kdl
+spawn-at-startup "woven"
+
+binds {
+    Super+Grave { spawn "woven-ctrl" "--toggle"; }
+}
+```
+
+### Sway ⚠️
+
+```
+exec woven
+bindsym Super+grave exec woven-ctrl --toggle
+```
+
+---
+
+## Usage
+
+| Action | Result |
+|--------|--------|
+| Click a window card | Focus that window, close overlay |
+| Hover a window card | Show action buttons |
+| Right-click / any key | Close overlay |
+| Scroll | Scroll through workspaces |
+
+### Hover buttons
+
+| Button | Action |
+|--------|--------|
+| ✕ | Close window |
+| ⧉ | Toggle float |
+| ⊞ | Toggle fullscreen |
+| ⬡ | Toggle pin |
+
+---
+
+## Configuration
+
+Config lives at `~/.config/woven/woven.lua`. Open `woven-ctrl` to edit theme and settings with a GUI, or use the built in editor included in woven-ctrl directly. Changes apply with the click of a button:
+
+```bash
+woven-ctrl --reload
+```
+
+### Theme
+
+```lua
+woven.theme({
+    background    = "#1e1e2e",
+    border        = "#6c7086",
+    text          = "#cdd6f4",
+    accent        = "#cba6f7",
+    border_radius = 12,
+    font          = "JetBrainsMono Nerd Font",
+    font_size     = 13,
+    opacity       = 0.92,
+})
+```
+
+Built-in presets selectable in `woven-ctrl`: Catppuccin Mocha, Dracula, Nord, Tokyo Night, Gruvbox.
+
+### Workspaces
+
+```lua
+woven.workspaces({
+    show_empty = false,
+    min_width  = 200,
+    max_width  = 400,
+})
+```
+
+### Settings
+
+```lua
+woven.settings({
+    scroll_dir      = "horizontal",  -- or "vertical"
+    overlay_opacity = 0.92,
+})
+```
+
+### Animations
+
+```lua
+woven.animations({
+    overlay_open  = { curve = "ease_out_cubic",    duration_ms = 180 },
+    overlay_close = { curve = "ease_in_cubic",     duration_ms = 120 },
+    scroll        = { curve = "ease_in_out_cubic", duration_ms = 200 },
+})
+```
+
+Curves: `linear` `ease_out_cubic` `ease_in_cubic` `ease_in_out_cubic` `spring`
+
+---
+
+## woven-ctrl
+
+```
+woven-ctrl              open the GUI control panel
+woven-ctrl --toggle     toggle the overlay
+woven-ctrl --show       show the overlay
+woven-ctrl --hide       hide the overlay
+woven-ctrl --reload     reload config from disk
+woven-ctrl --setup      run the first-time setup wizard
+```
+
+---
+
+## Architecture
+
+```
+woven (daemon)
+├── woven-sys       main process — Lua VM, IPC server, compositor backend
+├── woven-render    render thread — Wayland surface, tiny-skia painter
+├── woven-common    shared types and IPC protocol
+└── woven-ctrl      iced GUI + CLI control panel
+
+Runtime:  /usr/local/share/woven/runtime/
+Config:   ~/.config/woven/woven.lua
+IPC:      /run/user/$UID/woven.sock
+```
+
+The Lua runtime handles config, theming, workspace layout, and animation declarations. Rust handles all rendering, input, and compositor communication.
+
+---
+
+## v2 plans
+
+- Window thumbnails
+- Lua plugin API
+- River backend
+- Better x11 to wayland support
+- Look like niri's overlay with the pop out feature and add the bar ontop with everything.
+- True popout features
