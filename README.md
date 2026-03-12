@@ -5,6 +5,15 @@ A Wayland workspace overview daemon. Press a key, see all your workspaces and wi
 ```
 Super+` → overlay appears → click a window → overlay closes, window focused
 ```
+## Install
+
+### From source
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/viewerofall/woven/main/get.sh | bash
+```
+
+`get.sh` downloads a compressed version of all the files neccessary for a prebuilt startup from the repo, uncompresses it and copies everything neccesary over to your system
 
 ---
 
@@ -13,7 +22,7 @@ Super+` → overlay appears → click a window → overlay closes, window focuse
 | Compositor | Status |
 |------------|--------|
 | Hyprland   | ✅ Full support |
-| Niri       | ✅ Full support |
+| Niri       | ⚠️  Performance issues |
 | Sway       | ⚠️ Implemented, untested |
 
 GNOME is not supported — it does not implement `wlr-layer-shell`.
@@ -21,20 +30,23 @@ KDE is coming in v2.5/3 and will not be meant for daily use due to the fact it d
 
 ---
 
-## Install
 
-### From source
-
-```bash
-This is for later, I will update and add the rules needed for it
-```
-
-`install.sh` copies everything over and runs the daemon, implementing automatic detection of desktop environments soon 
 
 ### Manual
-
+## You can either download comp.tar.gz which is everything without the setup or manually do it
+Download comp.tar.gz
+- Extract it
+- Copy woven.service to ~/.config/systemd/user
+- Copy runtime and woven.lua to ~/.config/woven
+- Run ```cargo build --release```
+- Copy executables ```cp target/release/woven ~/.local/bin && cp target/release/woven-ctrl ~/.local/bin```
+- 
 ```bash
-Later, maybe tomorrow, maybe later today who knows
+git clone https://github.com/viewerofall/woven.git && cd woven
+mkdir ~/.config/woven && cp -r runtime ~/.config/woven && cp woven.lua ~/.config/woven
+cp woven.service ~/.config/systemd/user && systemctl daemon-reload && sudo systemctl --user enable woven.service
+cargo build --release
+cp target/release/woven ~/.local/bin && cp target/release/woven-ctrl ~/.local/bin
 ```
 
 ---
