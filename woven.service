@@ -1,0 +1,18 @@
+[Unit]
+Description=woven workspace overlay daemon
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/woven
+Environment=WOVEN_LOG=info
+Environment=WOVEN_ROOT=%h/.config/woven
+PassEnvironment=WAYLAND_DISPLAY
+PassEnvironment=XDG_RUNTIME_DIR
+PassEnvironment=HYPRLAND_INSTANCE_SIGNATURE
+PassEnvironment=DISPLAY
+Restart=no
+
+[Install]
+WantedBy=graphical-session.target
