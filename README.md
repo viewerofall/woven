@@ -84,6 +84,9 @@ bindsym Super+grave exec woven-ctrl --toggle
 ```
 
 ---
+## Shell setup 
+Automatic setup later
+ ``` sudo touch /etc/profile.d/woven.sh && sudo cat <<EOF >> /etc/profile.d/woven.sh export WOVEN_ROOT="$HOME/.config/woven" EOF ```
 
 ## Usage
 
