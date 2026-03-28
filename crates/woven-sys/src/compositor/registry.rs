@@ -13,6 +13,7 @@ use tracing::info;
 use super::backend::CompositorBackend;
 use super::hyprland::HyprlandBackend;
 use super::niri::NiriBackend;
+use super::river::RiverBackend;
 use super::sway::SwayBackend;
 
 /// Try each registered backend in order, return the first that detects.
@@ -26,18 +27,23 @@ pub fn detect_backend() -> Result<Arc<dyn CompositorBackend>> {
     let backends: Vec<(&str, bool, Constructor)> = vec![
         (
             "hyprland",
-         HyprlandBackend::detect(),
-         Box::new(|| Ok(Arc::new(HyprlandBackend::new()?) as Arc<dyn CompositorBackend>)),
+            HyprlandBackend::detect(),
+            Box::new(|| Ok(Arc::new(HyprlandBackend::new()?) as Arc<dyn CompositorBackend>)),
         ),
         (
             "niri",
-         NiriBackend::detect(),
-         Box::new(|| Ok(Arc::new(NiriBackend::new()?) as Arc<dyn CompositorBackend>)),
+            NiriBackend::detect(),
+            Box::new(|| Ok(Arc::new(NiriBackend::new()?) as Arc<dyn CompositorBackend>)),
         ),
         (
             "sway",
-         SwayBackend::detect(),
-         Box::new(|| Ok(Arc::new(SwayBackend::new()?) as Arc<dyn CompositorBackend>)),
+            SwayBackend::detect(),
+            Box::new(|| Ok(Arc::new(SwayBackend::new()?) as Arc<dyn CompositorBackend>)),
+        ),
+        (
+            "river",
+            RiverBackend::detect(),
+            Box::new(|| Ok(Arc::new(RiverBackend::new()?) as Arc<dyn CompositorBackend>)),
         ),
     ];
 
@@ -50,7 +56,7 @@ pub fn detect_backend() -> Result<Arc<dyn CompositorBackend>> {
 
     bail!(
         "No supported compositor detected.\n\
-Currently supported: Hyprland, Niri, Sway\n\
+Currently supported: Hyprland, Niri, Sway, River\n\
 To add support for your compositor, implement CompositorBackend\n\
 in crates/woven-sys/src/compositor/<n>.rs and register it in registry.rs"
     )

@@ -4,6 +4,7 @@ members = [
     "crates/woven-render",
     "crates/woven-common",
     "crates/woven-ctrl",
+    "crates/woven-protocols",
 ]
 resolver = "2"
 
@@ -19,9 +20,10 @@ crossbeam-channel = "0.5"
 mlua = { version = "0.10", features = ["lua54", "send", "async", "vendored"] }
 
 # wayland
-smithay-client-toolkit = "0.19"
+smithay-client-toolkit = "0.20"
 wayland-client         = "0.31"
-wayland-protocols      = { version = "0.32", features = ["client"] }
+# staging enables ext::foreign_toplevel_list, ext::image_copy_capture, ext::image_capture_source
+wayland-protocols      = { version = "0.32", features = ["client", "staging"] }
 wayland-protocols-wlr  = { version = "0.3",  features = ["client"] }
 
 # serialization
@@ -37,6 +39,10 @@ xcb = "1.3"
 # rendering
 tiny-skia = "0.11"
 fontdue   = "0.9"
+chrono    = { version = "0.4", features = ["clock"] }
+
+# shm + mmap for screencopy frame buffers
+rustix = { version = "1", features = ["event", "mm", "fs", "time"] }
 
 [profile.release]
 opt-level     = 3

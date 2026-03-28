@@ -6,7 +6,7 @@ use mlua::prelude::*;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::info;
-use woven_common::types::{AnimationConfig, Theme};
+use woven_common::types::{AnimationConfig, BarConfig, Theme};
 
 use crate::compositor::backend::CompositorBackend;
 use crate::sys::proc_metrics::MetricsCollector;
@@ -113,6 +113,7 @@ pub fn bind(lua: &Lua, state: Arc<AppState>) -> anyhow::Result<()> {
     bind_log(lua, &woven)?;
     bind_process(lua, &woven)?;
     bind_config_api(lua, &woven, state.clone())?;
+    bind_bar_api(lua, &woven, state.clone())?;
 
     // safe require — only resolves from runtime/ and config dir
     let runtime_dir = state.runtime_dir.clone();
@@ -444,5 +445,20 @@ fn bind_config_api(lua: &Lua, woven: &LuaTable, state: Arc<AppState>) -> LuaResu
     })?;
 
     woven.set("theme", set_theme)?;
+    Ok(())
+}
+
+fn bind_bar_api(lua: &Lua, woven: &LuaTable, state: Arc<AppState>) -> LuaResult<()> {
+    let render = state.render.clone();
+    // woven.bar({ enabled = true, position = "right" })
+    let set_bar = lua.create_function(move |_, t: LuaTable| {
+        let enabled  = t.get::<bool>("enabled").unwrap_or(true);
+        let position = t.get::<String>("position").unwrap_or_else(|_| "right".into());
+        let json = serde_json::json!({ "enabled": enabled, "position": position });
+        let cfg: BarConfig = serde_json::from_value(json).map_err(LuaError::external)?;
+        render.send(RenderCmd::UpdateBarConfig(cfg));
+        Ok(())
+    })?;
+    woven.set("bar", set_bar)?;
     Ok(())
 }

@@ -104,6 +104,25 @@ impl Default for AnimationDef {
     }
 }
 
+/// Persistent workspace bar configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BarConfig {
+    #[serde(default = "default_true")]
+    pub enabled:  bool,
+    #[serde(default)]
+    pub position: BarPosition,
+}
+
+impl Default for BarConfig {
+    fn default() -> Self { Self { enabled: false, position: BarPosition::Right } }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BarPosition { Left, #[default] Right, Top, Bottom }
+
+fn default_true() -> bool { true }
+
 /// Full animation config handed from Lua to Rust once at startup
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AnimationConfig {

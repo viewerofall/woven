@@ -1,0 +1,22 @@
+[package]
+name    = "woven-protocols"
+version = "0.1.0"
+edition = "2021"
+description = "woven Wayland protocol extensions — screencopy, foreign-toplevel, image-capture"
+
+[dependencies]
+woven-common = { path = "../woven-common" }
+
+wayland-client   = { workspace = true }
+wayland-protocols = { workspace = true }
+wayland-protocols-wlr = { workspace = true }
+
+anyhow  = { workspace = true }
+tracing = { workspace = true }
+
+# channel for request/frame passing between threads
+crossbeam-channel = { workspace = true }
+
+# shm (memfd + mmap) + poll for the screencopy thread
+# NOTE: workspace rustix = "1" — needs event + fs + mm features
+rustix = { workspace = true }

@@ -120,19 +120,27 @@ async fn main() -> Result<()> {
         let render_poll  = render.clone();
 
         if let Some(mut events) = state.backend.event_stream() {
-            // event-driven path: fire immediately on relevant compositor events
-            // + a 2s heartbeat so the display stays fresh even if we miss an event
             tokio::spawn(async move {
                 let poll_interval = tokio::time::Duration::from_millis(2000);
                 let mut interval  = tokio::time::interval(poll_interval);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut prev_active_ws: Option<u32> = None;
 
                 loop {
                     tokio::select! {
-                        _ = events.recv() => {}  // compositor event — refresh now
-                        _ = interval.tick() => {} // heartbeat
+                        _ = events.recv() => {}
+                        _ = interval.tick() => {}
                     }
                     if let Ok(workspaces) = backend_poll.workspaces().await {
+                        // Detect workspace transition — trigger a screencopy of the
+                        // newly active workspace while it's live on screen.
+                        let active = workspaces.iter().find(|w| w.active).map(|w| w.id);
+                        if active != prev_active_ws {
+                            if let Some(ws_id) = active {
+                                render_poll.send(RenderCmd::CaptureForWorkspace(ws_id));
+                            }
+                            prev_active_ws = active;
+                        }
                         render_poll.send(RenderCmd::UpdateState { workspaces, metrics: vec![] });
                     }
                 }
@@ -140,8 +148,16 @@ async fn main() -> Result<()> {
         } else {
             // fallback: plain 2s poll for backends without event streams
             tokio::spawn(async move {
+                let mut prev_active_ws: Option<u32> = None;
                 loop {
                     if let Ok(workspaces) = backend_poll.workspaces().await {
+                        let active = workspaces.iter().find(|w| w.active).map(|w| w.id);
+                        if active != prev_active_ws {
+                            if let Some(ws_id) = active {
+                                render_poll.send(RenderCmd::CaptureForWorkspace(ws_id));
+                            }
+                            prev_active_ws = active;
+                        }
                         render_poll.send(RenderCmd::UpdateState { workspaces, metrics: vec![] });
                     }
                     tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
@@ -311,11 +327,29 @@ async fn main() -> Result<()> {
                     }
                     let cmd = match action {
                         WindowAction::Focus(id)            => WmCommand::FocusWindow(id),
-                     WindowAction::Close(id)            => WmCommand::CloseWindow(id),
-                     WindowAction::ToggleFloat(id)      => WmCommand::ToggleFloat(id),
-                     WindowAction::TogglePin(id)        => WmCommand::TogglePin(id),
-                     WindowAction::ToggleFullscreen(id) => WmCommand::FullscreenWindow(id),
-                     WindowAction::CloseOverlay         => unreachable!(),
+                        WindowAction::Close(id)            => WmCommand::CloseWindow(id),
+                        WindowAction::ToggleFloat(id)      => WmCommand::ToggleFloat(id),
+                        WindowAction::TogglePin(id)        => WmCommand::TogglePin(id),
+                        WindowAction::ToggleFullscreen(id) => WmCommand::FullscreenWindow(id),
+                        WindowAction::FocusWorkspace(id)   => WmCommand::FocusWorkspace(id),
+                        // All of the following are consumed in the render thread:
+                        WindowAction::CloseOverlay         => unreachable!(),
+                        WindowAction::PreviewWorkspace(_)  => unreachable!(),
+                        WindowAction::ClosePanel           => unreachable!(),
+                        WindowAction::ToggleOverlay        => unreachable!(),
+                        WindowAction::HideBar              => unreachable!(),
+                        WindowAction::ExpandPanel          => unreachable!(),
+                        WindowAction::CollapsePanel        => unreachable!(),
+                        WindowAction::PowerSuspend         => unreachable!(),
+                        WindowAction::PowerReboot          => unreachable!(),
+                        WindowAction::PowerShutdown        => unreachable!(),
+                        WindowAction::PowerLock            => unreachable!(),
+                        WindowAction::PowerLogout          => unreachable!(),
+                        WindowAction::MediaPlayPause       => unreachable!(),
+                        WindowAction::MediaNext            => unreachable!(),
+                        WindowAction::MediaPrev            => unreachable!(),
+                        WindowAction::WifiToggle           => unreachable!(),
+                        WindowAction::BtToggle             => unreachable!(),
                     };
                     if let Err(e) = backend_actions.dispatch(cmd).await {
                         tracing::warn!("window action failed: {:#}", e);

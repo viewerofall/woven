@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod hyprland;
 pub mod niri;
+pub mod river;
 pub mod sway;
 pub mod registry;
 pub mod xwayland;

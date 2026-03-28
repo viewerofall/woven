@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-woven-common = { path = "../woven-common" }
+woven-common    = { path = "../woven-common" }
+woven-protocols = { path = "../woven-protocols" }
 
 tokio               = { workspace = true }
 anyhow              = { workspace = true }
@@ -14,9 +15,11 @@ tracing             = { workspace = true }
 crossbeam-channel   = { workspace = true }
 tiny-skia = { workspace = true }
 fontdue   = { workspace = true }
+chrono    = { workspace = true }
 
 smithay-client-toolkit = { workspace = true }
 wayland-client         = { workspace = true }
 wayland-protocols      = { workspace = true }
 wayland-protocols-wlr  = { workspace = true }
-rustix = { version = "0.38", features = ["event", "mm", "fs"] }
+rustix = { workspace = true }
+png    = "0.17"

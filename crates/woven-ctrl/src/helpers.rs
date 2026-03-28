@@ -16,8 +16,8 @@ pub fn send_ipc(cmd: IpcCommand) -> Option<IpcResponse> {
 
 pub fn config_path() -> String {
     let base = std::env::var("XDG_CONFIG_HOME")
-    .unwrap_or_else(|_| format!("{}/.config",
-                                std::env::var("HOME").unwrap_or_else(|_| ".".into())));
+        .unwrap_or_else(|_| format!("{}/.config",
+            std::env::var("HOME").unwrap_or_else(|_| ".".into())));
     format!("{}/woven/woven.lua", base)
 }
 
@@ -37,6 +37,51 @@ pub fn write_config(content: &str) -> Result<(), String> {
     std::fs::write(&path, content).map_err(|e| e.to_string())
 }
 
+// ── Lua parsers ───────────────────────────────────────────────────────────────
+
+pub fn lua_str(src: &str, key: &str) -> Option<String> {
+    let needle = format!("{} = \"", key);
+    let start  = src.find(&needle)? + needle.len();
+    let end    = start + src[start..].find('"')?;
+    Some(src[start..end].to_string())
+}
+
+pub fn lua_num(src: &str, key: &str) -> Option<String> {
+    let needle = format!("{} = ", key);
+    let start  = src.find(&needle)? + needle.len();
+    let end    = start + src[start..].find(|c: char| c == ',' || c == '\n' || c == '}')?;
+    let val = src[start..end].trim().to_string();
+    if val.is_empty() { None } else { Some(val) }
+}
+
+pub fn lua_bool(src: &str, key: &str) -> Option<bool> {
+    let needle = format!("{} = ", key);
+    let start  = src.find(&needle)? + needle.len();
+    let end    = start + src[start..].find(|c: char| c == ',' || c == '\n' || c == '}')?;
+    match src[start..end].trim() {
+        "true"  => Some(true),
+        "false" => Some(false),
+        _       => None,
+    }
+}
+
+/// Parse `key = { curve = "...", duration_ms = ... }` from within an animations block.
+pub fn lua_anim(src: &str, key: &str) -> (String, String) {
+    let needle = format!("{} ", key.trim());
+    if let Some(line_start) = src.find(&needle) {
+        let line_end = src[line_start..].find('\n')
+            .map(|i| line_start + i)
+            .unwrap_or(src.len());
+        let line = &src[line_start..line_end];
+        let curve = lua_str(line, "curve").unwrap_or_else(|| "ease_out_cubic".into());
+        let ms    = lua_num(line, "duration_ms").unwrap_or_else(|| "180".into());
+        return (curve, ms);
+    }
+    ("ease_out_cubic".into(), "180".into())
+}
+
+// ── Theme ─────────────────────────────────────────────────────────────────────
+
 pub const PRESETS: &[&str] = &[
     "Catppuccin Mocha", "Dracula", "Nord", "Tokyo Night", "Gruvbox", "Custom",
 ];
@@ -50,22 +95,6 @@ pub fn preset_colors(preset: &str) -> (&'static str, &'static str, &'static str,
         "Gruvbox"          => ("#282828", "#d79921", "#ebdbb2", "#504945"),
         _                  => ("#1e1e2e", "#cba6f7", "#cdd6f4", "#6c7086"),
     }
-}
-
-pub fn lua_str(src: &str, key: &str) -> Option<String> {
-    let needle = format!("{} = \"", key);
-    let start  = src.find(&needle)? + needle.len();
-    let end    = start + src[start..].find('"')?;
-    Some(src[start..end].to_string())
-}
-
-pub fn lua_num(src: &str, key: &str) -> Option<String> {
-    let needle = format!("{} = ", key);
-    let start  = src.find(&needle)? + needle.len();
-    let end    = start + src[start..]
-    .find(|c: char| c == ',' || c == '\n' || c == '}')?;
-    let val = src[start..end].trim().to_string();
-    if val.is_empty() { None } else { Some(val) }
 }
 
 pub struct ParsedTheme {
@@ -101,65 +130,184 @@ pub fn parse_theme_from_config() -> ParsedTheme {
 
 pub fn build_theme_block(bg: &str, accent: &str, txt: &str, border: &str,
                          radius: u32, opacity: f32) -> String {
-                             format!(
-                                 concat!(
-                                     "woven.theme({{\n",
-                                         "    background    = \"{}\",\n",
-                                         "    border        = \"{}\",\n",
-                                         "    text          = \"{}\",\n",
-                                         "    accent        = \"{}\",\n",
-                                         "    border_radius = {},\n",
-                                         "    font          = \"JetBrainsMono Nerd Font\",\n",
-                                         "    font_size     = 13,\n",
-                                         "    opacity       = {:.2},\n",
-                                         "}})",
-                                 ),
-                                 bg, border, txt, accent, radius, opacity
-                             )
-                         }
+    format!(concat!(
+        "woven.theme({{\n",
+        "    background    = \"{}\",\n",
+        "    border        = \"{}\",\n",
+        "    text          = \"{}\",\n",
+        "    accent        = \"{}\",\n",
+        "    border_radius = {},\n",
+        "    font          = \"JetBrainsMono Nerd Font\",\n",
+        "    font_size     = 13,\n",
+        "    opacity       = {:.2},\n",
+        "}})",
+    ), bg, border, txt, accent, radius, opacity)
+}
 
-                         pub fn splice_theme_into_config(config: &str, block: &str) -> String {
-                             if let Some(start) = config.find("woven.theme({") {
-                                 let rest = &config[start..];
-                                 if let Some(rel) = rest.find("})") {
-                                     let end = start + rel + 2;
-                                     return format!("{}{}{}", &config[..start], block, &config[end..]);
-                                 }
-                             }
-                             format!("{}\n{}\n", config.trim_end(), block)
-                         }
+pub fn splice_theme_into_config(config: &str, block: &str) -> String {
+    splice_block(config, "woven.theme({", block)
+}
 
-                         pub fn default_config() -> String {
-                             concat!(
-                                 "-- ~/.config/woven/woven.lua\n",
-                                 "-- Reload live: woven-ctrl --reload\n",
-                                 "\n",
-                                 "woven.theme({\n",
-                                     "    background    = \"#1e1e2e\",\n",
-                                     "    border        = \"#6c7086\",\n",
-                                     "    text          = \"#cdd6f4\",\n",
-                                     "    accent        = \"#cba6f7\",\n",
-                                     "    border_radius = 12,\n",
-                                     "    font          = \"JetBrainsMono Nerd Font\",\n",
-                                     "    font_size     = 13,\n",
-                                     "    opacity       = 0.92,\n",
-                                     "})\n",
-                                     "\n",
-                                     "woven.workspaces({\n",
-                                     "    show_empty = false,\n",
-                                     "    min_width  = 200,\n",
-                                     "    max_width  = 400,\n",
-                                     "})\n",
-                                     "\n",
-                                     "woven.settings({\n",
-                                     "    scroll_dir      = \"horizontal\",\n",
-                                     "    overlay_opacity = 0.92,\n",
-                                     "})\n",
-                                     "\n",
-                                     "woven.animations({\n",
-                                     "    overlay_open  = { curve = \"ease_out_cubic\",    duration_ms = 180 },\n",
-                                     "    overlay_close = { curve = \"ease_in_cubic\",     duration_ms = 120 },\n",
-                                     "    scroll        = { curve = \"ease_in_out_cubic\", duration_ms = 200 },\n",
-                                     "})\n",
-                             ).into()
-                         }
+// ── Bar ───────────────────────────────────────────────────────────────────────
+
+pub const BAR_POSITIONS: &[&str] = &["right", "left", "top", "bottom"];
+
+pub struct ParsedBar {
+    pub enabled:  bool,
+    pub position: String,
+}
+
+pub fn parse_bar_from_config() -> ParsedBar {
+    let raw = read_config();
+    ParsedBar {
+        enabled:  lua_bool(&raw, "enabled").unwrap_or(true),
+        position: lua_str(&raw, "position").unwrap_or_else(|| "right".into()),
+    }
+}
+
+pub fn build_bar_block(enabled: bool, position: &str) -> String {
+    format!(concat!(
+        "woven.bar({{\n",
+        "    enabled  = {},\n",
+        "    position = \"{}\",\n",
+        "}})",
+    ), enabled, position)
+}
+
+pub fn splice_bar_into_config(config: &str, block: &str) -> String {
+    splice_block(config, "woven.bar({", block)
+}
+
+// ── Overview / animations ─────────────────────────────────────────────────────
+
+pub const ANIM_CURVES: &[&str] = &[
+    "ease_out_cubic", "ease_in_cubic", "ease_in_out_cubic", "linear", "spring",
+];
+
+pub struct ParsedOverview {
+    pub show_empty:         bool,
+    pub scroll_dir:         String,
+    pub anim_open_curve:    String,
+    pub anim_open_ms:       String,
+    pub anim_close_curve:   String,
+    pub anim_close_ms:      String,
+    pub anim_scroll_curve:  String,
+    pub anim_scroll_ms:     String,
+}
+
+pub fn parse_overview_from_config() -> ParsedOverview {
+    let raw = read_config();
+    let (open_curve,   open_ms)   = lua_anim(&raw, "overlay_open");
+    let (close_curve,  close_ms)  = lua_anim(&raw, "overlay_close");
+    let (scroll_curve, scroll_ms) = lua_anim(&raw, "scroll");
+    ParsedOverview {
+        show_empty:        lua_bool(&raw, "show_empty").unwrap_or(false),
+        scroll_dir:        lua_str(&raw, "scroll_dir").unwrap_or_else(|| "horizontal".into()),
+        anim_open_curve:   open_curve,
+        anim_open_ms:      open_ms,
+        anim_close_curve:  close_curve,
+        anim_close_ms:     close_ms,
+        anim_scroll_curve: scroll_curve,
+        anim_scroll_ms:    scroll_ms,
+    }
+}
+
+pub fn build_workspaces_block(show_empty: bool) -> String {
+    format!(concat!(
+        "woven.workspaces({{\n",
+        "    show_empty = {},\n",
+        "    min_width  = 200,\n",
+        "    max_width  = 400,\n",
+        "}})",
+    ), show_empty)
+}
+
+pub fn build_settings_block(scroll_dir: &str) -> String {
+    format!(concat!(
+        "woven.settings({{\n",
+        "    scroll_dir      = \"{}\",\n",
+        "    overlay_opacity = 0.92,\n",
+        "}})",
+    ), scroll_dir)
+}
+
+pub fn build_animations_block(
+    open_curve: &str,  open_ms: &str,
+    close_curve: &str, close_ms: &str,
+    scroll_curve: &str, scroll_ms: &str,
+) -> String {
+    format!(concat!(
+        "woven.animations({{\n",
+        "    overlay_open  = {{ curve = \"{}\", duration_ms = {} }},\n",
+        "    overlay_close = {{ curve = \"{}\", duration_ms = {} }},\n",
+        "    scroll        = {{ curve = \"{}\", duration_ms = {} }},\n",
+        "}})",
+    ), open_curve, open_ms, close_curve, close_ms, scroll_curve, scroll_ms)
+}
+
+pub fn splice_workspaces_into_config(config: &str, block: &str) -> String {
+    splice_block(config, "woven.workspaces({", block)
+}
+
+pub fn splice_settings_into_config(config: &str, block: &str) -> String {
+    splice_block(config, "woven.settings({", block)
+}
+
+pub fn splice_animations_into_config(config: &str, block: &str) -> String {
+    splice_block(config, "woven.animations({", block)
+}
+
+// ── Default config ────────────────────────────────────────────────────────────
+
+pub fn default_config() -> String {
+    concat!(
+        "-- ~/.config/woven/woven.lua\n",
+        "-- Reload live: woven-ctrl --reload\n",
+        "\n",
+        "woven.theme({\n",
+        "    background    = \"#1e1e2e\",\n",
+        "    border        = \"#6c7086\",\n",
+        "    text          = \"#cdd6f4\",\n",
+        "    accent        = \"#cba6f7\",\n",
+        "    border_radius = 12,\n",
+        "    font          = \"JetBrainsMono Nerd Font\",\n",
+        "    font_size     = 13,\n",
+        "    opacity       = 0.92,\n",
+        "})\n",
+        "\n",
+        "woven.bar({\n",
+        "    enabled  = true,\n",
+        "    position = \"right\",\n",
+        "})\n",
+        "\n",
+        "woven.workspaces({\n",
+        "    show_empty = false,\n",
+        "    min_width  = 200,\n",
+        "    max_width  = 400,\n",
+        "})\n",
+        "\n",
+        "woven.settings({\n",
+        "    scroll_dir      = \"horizontal\",\n",
+        "    overlay_opacity = 0.92,\n",
+        "})\n",
+        "\n",
+        "woven.animations({\n",
+        "    overlay_open  = { curve = \"ease_out_cubic\",    duration_ms = 180 },\n",
+        "    overlay_close = { curve = \"ease_in_cubic\",     duration_ms = 120 },\n",
+        "    scroll        = { curve = \"ease_in_out_cubic\", duration_ms = 200 },\n",
+        "})\n",
+    ).into()
+}
+
+// ── Internal ──────────────────────────────────────────────────────────────────
+
+fn splice_block(config: &str, marker: &str, block: &str) -> String {
+    if let Some(start) = config.find(marker) {
+        let rest = &config[start..];
+        if let Some(rel) = rest.find("})") {
+            let end = start + rel + 2;
+            return format!("{}{}{}", &config[..start], block, &config[end..]);
+        }
+    }
+    format!("{}\n{}\n", config.trim_end(), block)
+}

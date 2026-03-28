@@ -191,6 +191,8 @@ impl CompositorBackend for SwayBackend {
             WmCommand::MoveWindow { id, workspace } |
             WmCommand::MoveToWorkspace { id, ws: workspace } =>
             format!("[con_id={}] move to workspace number {}", id, workspace),
+            WmCommand::FocusWorkspace(id) =>
+            format!("workspace number {}", id),
         };
 
         let resp = self.ipc(MSG_RUN_COMMAND, &sway_cmd).await?;

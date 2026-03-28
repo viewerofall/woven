@@ -4,15 +4,19 @@
 //! After PID resolution they flow through the normal window pipeline.
 
 use anyhow::Result;
-use tracing::warn;
+use tracing::debug;
 
 /// Given an XWayland window's X11 window ID, resolve its PID via _NET_WM_PID.
 /// Falls back to None gracefully if xcb or the property isn't available.
+/// No warning when DISPLAY is unset (pure Wayland sessions) or resolution fails.
 pub fn resolve_pid(xwin_id: u32) -> Option<u32> {
+    if std::env::var("DISPLAY").is_err() {
+        return None;
+    }
     match try_resolve_pid(xwin_id) {
         Ok(pid) => Some(pid),
         Err(e) => {
-            warn!("XWayland PID resolution failed for {}: {}", xwin_id, e);
+            debug!("XWayland PID resolution failed for {}: {}", xwin_id, e);
             None
         }
     }

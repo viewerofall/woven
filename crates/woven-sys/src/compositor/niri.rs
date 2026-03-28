@@ -156,6 +156,8 @@ impl CompositorBackend for NiriBackend {
             }}}),
             // Niri doesn't have a pin concept, closest is sticky
             WmCommand::TogglePin(_) => return Ok(()),
+            WmCommand::FocusWorkspace(id) =>
+            serde_json::json!({"Action": {"FocusWorkspace": {"reference": {"Id": id}}}}),
         };
 
         let resp = self.ipc(action).await?;

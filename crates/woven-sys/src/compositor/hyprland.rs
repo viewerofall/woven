@@ -163,6 +163,8 @@ impl CompositorBackend for HyprlandBackend {
                                 format!("dispatch movetoworkspace {}, address:{}", workspace, id),
                                     WmCommand::MoveToWorkspace { id, ws } =>
                                     format!("dispatch movetoworkspace {}, address:{}", ws, id),
+                                    WmCommand::FocusWorkspace(id) =>
+                                    format!("dispatch workspace {}", id),
         };
 
         let resp = self.send(&dispatch_str).await?;

@@ -37,6 +37,7 @@ pub enum WmCommand {
     TogglePin(String),
     MoveWindow { id: String, workspace: u32 },
     MoveToWorkspace { id: String, ws: u32 },
+    FocusWorkspace(u32),
 }
 
 /// Events the compositor emits that Lua hooks can react to

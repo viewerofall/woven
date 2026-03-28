@@ -65,6 +65,18 @@ woven.animations({
     scroll        = { curve = "ease_in_out_cubic", duration_ms = 200 },
 })
 
+-- ── Bar ───────────────────────────────────────────────────────────────────────
+-- enabled:  show the persistent workspace bar (true / false)
+-- position: "left" | "right" | "top" | "bottom"
+--
+-- The bar shows workspace screenshots, a toggle button for the overlay,
+-- and a hide button.  Clicking a workspace thumbnail focuses it.
+
+woven.bar({
+    enabled  = true,
+    position = "right",
+})
+
 -- ── Hooks (optional) ─────────────────────────────────────────────────────────
 -- React to compositor events. Currently informational — use woven.log to debug.
 --
