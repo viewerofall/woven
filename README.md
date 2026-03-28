@@ -1,19 +1,21 @@
 # woven
 
-A Wayland workspace overview daemon. Press a key, see all your workspaces and windows at once, click to focus.
+A Wayland workspace overview daemon for tiling compositors. Press a key, see all your workspaces and windows at once, click to focus. Ships with a persistent sidebar bar that doubles as a control center.
 
 ```
 Super+` → overlay appears → click a window → overlay closes, window focused
 ```
-## Install
 
-### From source
+---
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/viewerofall/woven/main/get.sh | bash
-```
+## What's in v2
 
-`get.sh` downloads a compressed version of all the files neccessary for a prebuilt startup from the repo, uncompresses it and copies everything neccesary over to your system
+- **Workspace overview** — live screencopy thumbnails of every window, zoom animation, responsive grid layout
+- **Workspace strip** — horizontal strip of workspace cards at the top; click to preview, click again to switch
+- **Persistent bar** — docked side/top/bottom bar showing active workspaces, clock, and system stats
+- **Control center** — expand the bar to access media controls, CPU/GPU temps, and power menu
+- **Multi-monitor** — one bar per connected output, automatic hotplug handling
+- **River backend** — basic support alongside Hyprland, Niri, and Sway
 
 ---
 
@@ -22,38 +24,55 @@ curl -fsSL https://raw.githubusercontent.com/viewerofall/woven/main/get.sh | bas
 | Compositor | Status |
 |------------|--------|
 | Hyprland   | ✅ Full support |
-| Niri       | ⚠️  Performance issues |
-| Sway       | ⚠️ Implemented, untested |
+| Niri       | ✅ Full support |
+| Sway       | ✅ Full support |
+| River      | ⚠️ Basic support, untested |
 
 GNOME is not supported — it does not implement `wlr-layer-shell`.
-KDE is coming in v2.5/3 and will not be meant for daily use due to the fact it does not use the same system as window managers
+KDE support is planned for v2.5/v3.
 
 ---
 
+## Install
 
+### One-liner
 
-### Manual
-## You can either download comp.tar.gz which is everything without the setup or manually do it
-Download comp.tar.gz
-- Extract it
-- Copy woven.service to ~/.config/systemd/user
-- Copy runtime and woven.lua to ~/.config/woven
-- Run ```cargo build --release```
-- Copy executables ```cp target/release/woven ~/.local/bin && cp target/release/woven-ctrl ~/.local/bin```
-- 
 ```bash
-git clone https://github.com/viewerofall/woven.git && cd woven
-mkdir ~/.config/woven && cp -r runtime ~/.config/woven && cp woven.lua ~/.config/woven
-cp woven.service ~/.config/systemd/user && systemctl daemon-reload && sudo systemctl --user enable woven.service
+curl -fsSL https://raw.githubusercontent.com/viewerofall/woven/main/get.sh | sh
+```
+
+`get.sh` downloads the latest release, extracts it, and copies everything to the right places automatically.
+
+### From source
+
+```bash
+git clone https://github.com/viewerofall/woven.git
+cd woven
 cargo build --release
-cp target/release/woven ~/.local/bin && cp target/release/woven-ctrl ~/.local/bin
+```
+
+Then copy manually:
+
+```bash
+# Binaries
+cp target/release/woven target/release/woven-ctrl ~/.local/bin/
+
+# Config and runtime
+mkdir -p ~/.config/woven
+cp config/woven.lua ~/.config/woven/
+cp -r runtime ~/.config/woven/
+
+# Systemd user service
+cp woven.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable woven.service
 ```
 
 ---
 
 ## First-time setup
 
-On first launch, if no config exists, `woven` opens `woven-ctrl --setup` — a graphical wizard that handles compositor detection, color theme selection, and keybind instructions. No terminal interaction required.
+On first launch, if no config exists, `woven` opens `woven-ctrl --setup` — a graphical wizard that handles compositor detection, color theme selection, and keybind instructions. No terminal required.
 
 ---
 
@@ -76,41 +95,61 @@ binds {
 }
 ```
 
-### Sway ⚠️
+### Sway
 
 ```
 exec woven
 bindsym Super+grave exec woven-ctrl --toggle
 ```
 
+### River
+
+```sh
+riverctl spawn woven
+riverctl map normal Super grave spawn 'woven-ctrl --toggle'
+```
+
+> River: woven maps River tags 1–9 to workspaces 1–9. Window titles are not available due to River CLI limitations — `wlr-foreign-toplevel` support is planned.
+
 ---
-## Shell setup 
-Automatic setup later
- ``` sudo touch /etc/profile.d/woven.sh && sudo cat <<EOF >> /etc/profile.d/woven.sh export WOVEN_ROOT="$HOME/.config/woven" EOF ```
 
 ## Usage
+
+### Overlay
 
 | Action | Result |
 |--------|--------|
 | Click a window card | Focus that window, close overlay |
 | Hover a window card | Show action buttons |
+| Click a workspace card | Preview that workspace |
 | Right-click / any key | Close overlay |
-| Scroll | Scroll through workspaces |
+| Scroll | Page through workspaces |
 
 ### Hover buttons
 
 | Button | Action |
 |--------|--------|
+| focus | Focus window |
+| float | Toggle float |
+| pin | Toggle pin |
+| fs | Toggle fullscreen |
 | ✕ | Close window |
-| ⧉ | Toggle float |
-| ⊞ | Toggle fullscreen |
-| ⬡ | Toggle pin |
+
+### Bar
+
+The bar shows active workspaces, clock, and quick stats collapsed (52px). Click `>` to expand into the control center (300px).
+
+**Control center includes:**
+- Clock and system stats (CPU, GPU, RAM, volume)
+- Media player controls (requires `playerctl`)
+- WiFi and Bluetooth toggles (requires `nmcli` / `bluetoothctl`)
+- Power menu (suspend, reboot, shutdown, lock, logout)
 
 ---
 
 ## Configuration
 
-Config lives at `~/.config/woven/woven.lua`. Open `woven-ctrl` to edit theme and settings with a GUI, or use the built in editor included in woven-ctrl directly. Changes apply with the click of a button:
+Config lives at `~/.config/woven/woven.lua`. Edit through `woven-ctrl` or directly — reload with:
 
 ```bash
 woven-ctrl --reload
@@ -131,24 +170,22 @@ woven.theme({
 })
 ```
 
-Built-in presets selectable in `woven-ctrl`: Catppuccin Mocha, Dracula, Nord, Tokyo Night, Gruvbox.
+Built-in presets: Catppuccin Mocha, Dracula, Nord, Tokyo Night, Gruvbox.
+
+### Bar
+
+```lua
+woven.bar({
+    enabled  = true,
+    position = "right",   -- "left" | "right" | "top" | "bottom"
+})
+```
 
 ### Workspaces
 
 ```lua
 woven.workspaces({
     show_empty = false,
-    min_width  = 200,
-    max_width  = 400,
-})
-```
-
-### Settings
-
-```lua
-woven.settings({
-    scroll_dir      = "horizontal",  -- or "vertical"
-    overlay_opacity = 0.92,
 })
 ```
 
@@ -179,29 +216,31 @@ woven-ctrl --setup      run the first-time setup wizard
 
 ---
 
+## Dependencies
+
+Optional runtime dependencies — bar degrades gracefully without them:
+
+| Package | Used for |
+|---------|----------|
+| `playerctl` | Media controls |
+| `nmcli` | WiFi toggle |
+| `bluetoothctl` | Bluetooth toggle |
+
+---
+
 ## Architecture
 
 ```
 woven (daemon)
-├── woven-sys       main process — Lua VM, IPC server, compositor backend
-├── woven-render    render thread — Wayland surface, tiny-skia painter
-├── woven-common    shared types and IPC protocol
-└── woven-ctrl      iced GUI + CLI control panel
+├── woven-sys        main process — Lua VM, IPC server, compositor backends
+├── woven-render     render thread — Wayland surfaces, tiny-skia painter
+├── woven-protocols  Wayland protocol extensions — screencopy
+├── woven-common     shared types and IPC protocol
+└── woven-ctrl       iced GUI + CLI control panel
 
-Runtime:  /usr/local/share/woven/runtime/
+Runtime:  ~/.config/woven/runtime/
 Config:   ~/.config/woven/woven.lua
 IPC:      /run/user/$UID/woven.sock
 ```
 
-The Lua runtime handles config, theming, workspace layout, and animation declarations. Rust handles all rendering, input, and compositor communication.
-
----
-
-## v2 plans
-
-- Window thumbnails
-- Lua plugin API
-- River backend
-- Better x11 to wayland support
-- Look like niri's overlay with the pop out feature and add the bar ontop with everything.
-- True popout features
+The Lua runtime handles config, theming, and animation declarations. Rust handles all rendering, input, and compositor communication.
