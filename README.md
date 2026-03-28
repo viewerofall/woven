@@ -1,4 +1,4 @@
-# woven
+# woven - v2 alpha
 
 A Wayland workspace overview daemon for tiling compositors. Press a key, see all your workspaces and windows at once, click to focus. Ships with a persistent sidebar bar that doubles as a control center.
 
