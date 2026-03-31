@@ -3,7 +3,7 @@
 *why am i here*
 
 ### Welcome
-This branch is where I randomly post compressed versions of my entire codebase because well I dont trust my hard drive, most of these are inbetween versions for each of them like 3.tar.gz being version 1 for some reason and back.tar.gz as v1.5
+This branch is where I randomly post compressed versions of my entire codebase because well I dont trust my hard drive, most of these are inbetween versions for each of them like 3.tar.gz being version 1 for some reason and back.tar.gz as v2.1
 
 ### Index
 - back.tar.gz - one day after v2 alpha
