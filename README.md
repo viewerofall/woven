@@ -244,9 +244,3 @@ IPC:      /run/user/$UID/woven.sock
 ```
 
 The Lua runtime handles config, theming, and animation declarations. Rust handles all rendering, input, and compositor communication.
-
-## Coming soon
-### Full v2 features
-- Plugin api
-- Ai workspace naming (No llm or data collection)
-- Lua debugger and error handler
