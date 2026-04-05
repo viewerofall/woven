@@ -266,14 +266,18 @@ fn update(s: &mut App, msg: Msg) -> Task<Msg> {
         Msg::BarApply => {
             let block  = build_bar_block(s.bar_enabled, &s.bar_position);
             let config = splice_bar_into_config(&read_config(), &block);
-            match write_config(&config) {
-                Ok(()) => {
-                    s.config_content = text_editor::Content::with_text(&config);
-                    s.config_dirty   = false;
-                    send_ipc(IpcCommand::ReloadConfig);
-                    s.status = "Bar settings saved and applied.".into();
+            if let Err(e) = validate_lua_syntax(&config) {
+                s.status = format!("Lua error — not saved: {e}");
+            } else {
+                match write_config(&config) {
+                    Ok(()) => {
+                        s.config_content = text_editor::Content::with_text(&config);
+                        s.config_dirty   = false;
+                        send_ipc(IpcCommand::ReloadConfig);
+                        s.status = "Bar settings saved and applied.".into();
+                    }
+                    Err(e) => s.status = format!("Write failed: {e}"),
                 }
-                Err(e) => s.status = format!("Write failed: {e}"),
             }
         }
 
@@ -299,14 +303,18 @@ fn update(s: &mut App, msg: Msg) -> Task<Msg> {
             let radius:  u32 = s.radius.parse().unwrap_or(12);
             let block  = build_theme_block(&s.col_bg, &s.col_accent, &s.col_text, &s.col_border, radius, opacity);
             let config = splice_theme_into_config(&read_config(), &block);
-            match write_config(&config) {
-                Ok(()) => {
-                    s.config_content = text_editor::Content::with_text(&config);
-                    s.config_dirty   = false;
-                    send_ipc(IpcCommand::ReloadConfig);
-                    s.status = "Theme saved and applied.".into();
+            if let Err(e) = validate_lua_syntax(&config) {
+                s.status = format!("Lua error — not saved: {e}");
+            } else {
+                match write_config(&config) {
+                    Ok(()) => {
+                        s.config_content = text_editor::Content::with_text(&config);
+                        s.config_dirty   = false;
+                        send_ipc(IpcCommand::ReloadConfig);
+                        s.status = "Theme saved and applied.".into();
+                    }
+                    Err(e) => s.status = format!("Write failed: {e}"),
                 }
-                Err(e) => s.status = format!("Write failed: {e}"),
             }
         }
         Msg::ThemeReset => {
@@ -340,14 +348,18 @@ fn update(s: &mut App, msg: Msg) -> Task<Msg> {
             config = splice_workspaces_into_config(&config, &ws_block);
             config = splice_settings_into_config(&config, &set_block);
             config = splice_animations_into_config(&config, &anim_block);
-            match write_config(&config) {
-                Ok(()) => {
-                    s.config_content = text_editor::Content::with_text(&config);
-                    s.config_dirty   = false;
-                    send_ipc(IpcCommand::ReloadConfig);
-                    s.status = "Overview settings saved and applied.".into();
+            if let Err(e) = validate_lua_syntax(&config) {
+                s.status = format!("Lua error — not saved: {e}");
+            } else {
+                match write_config(&config) {
+                    Ok(()) => {
+                        s.config_content = text_editor::Content::with_text(&config);
+                        s.config_dirty   = false;
+                        send_ipc(IpcCommand::ReloadConfig);
+                        s.status = "Overview settings saved and applied.".into();
+                    }
+                    Err(e) => s.status = format!("Write failed: {e}"),
                 }
-                Err(e) => s.status = format!("Write failed: {e}"),
             }
         }
 
@@ -428,15 +440,26 @@ fn update(s: &mut App, msg: Msg) -> Task<Msg> {
         }
         Msg::PluginSettingsSave => {
             if let Some(plugin) = &s.plugin_settings_open.clone() {
-                if apply_plugin_settings(plugin, &s.plugin_settings_data) {
-                    s.config_content = text_editor::Content::with_text(&read_config());
-                    s.config_dirty = false;
-                    send_ipc(IpcCommand::ReloadConfig);
-                    s.plugins_status = format!("{} settings saved.", plugin);
-                    s.plugin_settings_open = None;
-                    s.plugin_settings_data.clear();
-                } else {
-                    s.plugins_status = "Failed to save plugin settings.".into();
+                let pending = {
+                    let raw = read_config();
+                    apply_plugin_settings_dry(plugin, &s.plugin_settings_data, &raw)
+                };
+                match pending {
+                    Some(new_config) => {
+                        if let Err(e) = validate_lua_syntax(&new_config) {
+                            s.plugins_status = format!("Lua error — not saved: {e}");
+                        } else if write_config(&new_config).is_ok() {
+                            s.config_content = text_editor::Content::with_text(&new_config);
+                            s.config_dirty = false;
+                            send_ipc(IpcCommand::ReloadConfig);
+                            s.plugins_status = format!("{} settings saved.", plugin);
+                            s.plugin_settings_open = None;
+                            s.plugin_settings_data.clear();
+                        } else {
+                            s.plugins_status = "Failed to write config.".into();
+                        }
+                    }
+                    None => s.plugins_status = "Failed to build plugin settings.".into(),
                 }
             }
         }
@@ -481,13 +504,18 @@ fn update(s: &mut App, msg: Msg) -> Task<Msg> {
             s.status         = "Reloaded from disk.".into();
         }
         Msg::ConfigSave => {
-            match write_config(&s.config_content.text()) {
-                Ok(()) => {
-                    send_ipc(IpcCommand::ReloadConfig);
-                    s.config_dirty = false;
-                    s.status = format!("Saved to {}", config_path());
+            let src = s.config_content.text();
+            if let Err(e) = validate_lua_syntax(&src) {
+                s.status = format!("Lua error — not saved: {e}");
+            } else {
+                match write_config(&src) {
+                    Ok(()) => {
+                        send_ipc(IpcCommand::ReloadConfig);
+                        s.config_dirty = false;
+                        s.status = format!("Saved to {}", config_path());
+                    }
+                    Err(e) => s.status = format!("Write failed: {e}"),
                 }
-                Err(e) => s.status = format!("Write failed: {e}"),
             }
         }
         Msg::ConfigReset => {
@@ -1273,11 +1301,14 @@ fn load_plugin_settings(name: &str) -> std::collections::HashMap<String, String>
 }
 
 /// Apply plugin settings by updating the config file.
-fn apply_plugin_settings(name: &str, settings: &std::collections::HashMap<String, String>) -> bool {
-    let config = read_config();
-
-    // Preserve existing widget opts (slot, height, interval) from the current call
-    let opts = extract_plugin_opts(&config, name);
+/// Build the new config string for plugin settings without writing it.
+/// Returns `None` if the plugin name is unknown.
+fn apply_plugin_settings_dry(
+    name: &str,
+    settings: &std::collections::HashMap<String, String>,
+    config: &str,
+) -> Option<String> {
+    let opts     = extract_plugin_opts(config, name);
     let slot     = lua_str(&opts, "slot").unwrap_or_default();
     let height   = lua_num(&opts, "height").unwrap_or_default();
     let interval = lua_num(&opts, "interval").unwrap_or_default();
@@ -1325,11 +1356,19 @@ fn apply_plugin_settings(name: &str, settings: &std::collections::HashMap<String
                 widget_opts, label, cmd
             )
         }
-        _ => return false,
+        _ => return None,
     };
 
-    let new_config = splice_plugin_setup(&config, name, &block);
-    write_config(&new_config).is_ok()
+    Some(splice_plugin_setup(config, name, &block))
+}
+
+#[allow(dead_code)]
+fn apply_plugin_settings(name: &str, settings: &std::collections::HashMap<String, String>) -> bool {
+    let config = read_config();
+    match apply_plugin_settings_dry(name, settings, &config) {
+        Some(new_config) => write_config(&new_config).is_ok(),
+        None => false,
+    }
 }
 
 // ── Config tab ────────────────────────────────────────────────────────────────

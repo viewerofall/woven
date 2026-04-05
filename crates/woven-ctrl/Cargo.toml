@@ -16,3 +16,4 @@ serde_json   = { workspace = true }
 tokio        = { version = "1", features = ["full"] }
 iced         = { version = "0.14", features = ["tokio", "advanced"] }
 ureq         = { workspace = true }
+mlua         = { workspace = true }

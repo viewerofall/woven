@@ -3,6 +3,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use woven_common::ipc::{IpcCommand, IpcResponse};
+use mlua::Lua;
 
 pub fn send_ipc(cmd: IpcCommand) -> Option<IpcResponse> {
     let mut stream = UnixStream::connect(woven_common::ipc::socket_path()).ok()?;
@@ -27,6 +28,18 @@ pub fn config_exists() -> bool {
 
 pub fn read_config() -> String {
     std::fs::read_to_string(config_path()).unwrap_or_else(|_| default_config())
+}
+
+/// Compile `src` as a Lua 5.4 chunk without executing it.
+/// Returns `Err(message)` on any syntax error so the caller can abort before
+/// writing the file or restarting the daemon.
+pub fn validate_lua_syntax(src: &str) -> Result<(), String> {
+    let lua = Lua::new();
+    lua.load(src)
+        .set_name("woven.lua")
+        .into_function()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 pub fn write_config(content: &str) -> Result<(), String> {
