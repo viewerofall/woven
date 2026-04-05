@@ -5,7 +5,7 @@
 set -e
 
 REPO="viewerofall/woven"
-TARBALL="v2-alpha.tar.gz"
+TARBALL="v2.2.tar.gz"
 TMP=$(mktemp -d)
 
 cleanup() { rm -rf "$TMP"; }
@@ -27,6 +27,19 @@ mkdir -p ~/.config/woven
 # Don't overwrite existing config
 [ -f ~/.config/woven/woven.lua ] || cp "$SRC/woven.lua" ~/.config/woven/woven.lua
 cp -r "$SRC/runtime" ~/.config/woven/
+
+echo "==> Installing plugins..."
+mkdir -p ~/.config/woven/plugins
+cp -n "$SRC/plugins/"*.lua ~/.config/woven/plugins/ 2>/dev/null || true
+
+echo "==> Installing desktop integration..."
+mkdir -p ~/.local/share/applications ~/.local/share/icons
+if [ -f "$SRC/woven-ctrl.desktop" ]; then
+    cp "$SRC/woven-ctrl.desktop" ~/.local/share/applications/
+    command -v update-desktop-database >/dev/null 2>&1 && \
+        update-desktop-database ~/.local/share/applications 2>/dev/null || true
+fi
+[ -f "$SRC/woven_icon.png" ] && cp "$SRC/woven_icon.png" ~/.local/share/icons/woven.png
 
 echo "==> Installing systemd user service..."
 mkdir -p ~/.config/systemd/user
@@ -67,6 +80,10 @@ export WOVEN_ROOT="$HOME/.config/woven"
 
 echo ""
 echo "==> woven installed."
+echo ""
+echo "    Configure via GUI:"
+echo "    Launch 'Woven Control Panel' from your app launcher"
+echo "    or run: woven-ctrl"
 echo ""
 echo "    Add your compositor keybind:"
 echo "    Hyprland: bind = SUPER, grave, exec, woven-ctrl --toggle"

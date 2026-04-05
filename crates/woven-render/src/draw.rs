@@ -21,25 +21,27 @@
 //! plain fill_rect when too small, eliminating the tiny-skia hairline AA panic.
 
 use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Rect, Transform};
-use woven_common::types::{AnimationConfig, BarPosition, Theme, Workspace, WorkspaceMetrics};
+use woven_common::types::{AnimationConfig, BarPosition, DrawCmd, LayoutConfig, Theme, WidgetDef, WidgetSlot, Workspace, WorkspaceMetrics};
 use crate::icons::IconCache;
 use crate::text::TextRenderer;
 use crate::thumbnail::{Thumbnail, ThumbnailCache, WorkspaceCache};
 use tracing::warn;
 
-const TOP_H:      f32 = 48.0;
-const WS_STRIP_H: f32 = 148.0;
-const WIDGET_H:   f32 = 56.0;
-const OUTER_PAD:  f32 = 20.0;
-const STRIP_GAP:  f32 = 12.0;
-const WS_THUMB_W: f32 = 200.0;
-const WS_THUMB_H: f32 = 110.0;
-#[allow(dead_code)]
-const WS_LABEL_H: f32 = 20.0;
-const WS_BTN_H:   f32 = 18.0;
-const CARD_PAD:         f32 = 16.0;
-const CARD_GAP:         f32 = 12.0;
-const CARD_THUMB_RATIO: f32 = 0.65;
+// Default layout values — mirrors LayoutConfig::default().
+// These are NOT used at runtime; each draw function reads from self.layout instead.
+// Kept here only as a quick reference for what the defaults are.
+#[allow(dead_code)] const DEF_TOP_H:           f32 = 48.0;
+#[allow(dead_code)] const DEF_WS_STRIP_H:      f32 = 148.0;
+#[allow(dead_code)] const DEF_WIDGET_H:        f32 = 56.0;
+#[allow(dead_code)] const DEF_OUTER_PAD:       f32 = 20.0;
+#[allow(dead_code)] const DEF_STRIP_GAP:       f32 = 12.0;
+#[allow(dead_code)] const DEF_WS_THUMB_W:      f32 = 200.0;
+#[allow(dead_code)] const DEF_WS_THUMB_H:      f32 = 110.0;
+#[allow(dead_code)] const DEF_WS_LABEL_H:      f32 = 20.0;
+#[allow(dead_code)] const DEF_WS_BTN_H:        f32 = 18.0;
+#[allow(dead_code)] const DEF_CARD_PAD:        f32 = 16.0;
+#[allow(dead_code)] const DEF_CARD_GAP:        f32 = 12.0;
+#[allow(dead_code)] const DEF_CARD_THUMB_RATIO: f32 = 0.65;
 
 // ── SysInfo ───────────────────────────────────────────────────────────────────
 
@@ -96,7 +98,7 @@ fn read_file(p: &str) -> String { std::fs::read_to_string(p).unwrap_or_default()
 fn read_os_key(key: &str) -> Option<String> {
     for line in read_file("/etc/os-release").lines() {
         if line.starts_with(key) {
-            return Some(line.splitn(2,'=').nth(1)?.trim_matches('"').to_string());
+            return Some(line.split_once('=')?.1.trim_matches('"').to_string());
         }
     }
     None
@@ -300,7 +302,7 @@ fn read_weather() -> Option<String> {
     static RUNNING:      AtomicBool            = AtomicBool::new(false);
     static LAST_REFRESH: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     let needs_refresh = LAST_REFRESH.lock().ok()
-        .map(|t| t.map_or(true, |ts| ts.elapsed().as_secs() > 600))
+        .map(|t| t.is_none_or(|ts| ts.elapsed().as_secs() > 600))
         .unwrap_or(true);
     if needs_refresh && !RUNNING.swap(true, Ordering::Relaxed) {
         std::thread::spawn(|| {
@@ -353,6 +355,14 @@ impl WsThumbRect {
     }
 }
 
+#[derive(Clone)]
+struct LaunchZone { x: f32, y: f32, w: f32, h: f32, cmd: String }
+impl LaunchZone {
+    fn hit(&self, mx: f32, my: f32) -> bool {
+        mx >= self.x && mx <= self.x+self.w && my >= self.y && my <= self.y+self.h
+    }
+}
+
 // ── Painter ───────────────────────────────────────────────────────────────────
 
 pub struct Painter {
@@ -380,12 +390,26 @@ pub struct Painter {
     output_thumb: Option<Thumbnail>,
     workspace_cache: WorkspaceCache,
     show_empty: bool,
+    /// Keyboard-focused card index into `self.cards` (None = no keyboard focus).
+    kb_win: Option<usize>,
+    /// Whether the search box is currently active.
+    search_active: bool,
+    /// Current search query string.
+    search_query:  String,
     // hover popup
     hovered_ws_idx: Option<usize>,
     // slide-out preview panel
     expanded_ws:       Option<u32>,
     pending_preview_ws: Option<u32>,
     panel_anim:        f32,
+    /// Layout dimensions — configurable via `woven.layout({})`.
+    layout:          LayoutConfig,
+    /// Plugin bar widgets: definition + last-rendered draw commands.
+    bar_widgets:     Vec<(WidgetDef, Vec<DrawCmd>)>,
+    /// Click zones for overlay launcher widgets — rebuilt every paint.
+    launcher_zones:  Vec<LaunchZone>,
+    /// Per-app accent colors from `woven.rules({})` — class (lowercase) → Color.
+    app_rules:       std::collections::HashMap<String, Color>,
     // persistent bar
     bar_pixmap:      Option<Pixmap>,
     bar_cards:       Vec<WsThumbRect>,
@@ -394,6 +418,8 @@ pub struct Painter {
     bar_mouse_y:     f32,
     /// Whether the bar is in expanded control-center mode.
     panel_expanded:  bool,
+    /// Active error toast: (message, shown_at, duration_ms).
+    toast: Option<(String, std::time::Instant, u32)>,
 }
 
 impl Painter {
@@ -416,22 +442,83 @@ impl Painter {
             output_thumb: None,
             workspace_cache: WorkspaceCache::new(),
             show_empty: false,
+            kb_win: None,
+            search_active: false,
+            search_query:  String::new(),
             hovered_ws_idx: None,
             expanded_ws: None,
             pending_preview_ws: None,
             panel_anim: 0.0,
+            layout:         LayoutConfig::default(),
+            bar_widgets:    vec![],
+            app_rules:      std::collections::HashMap::new(),
             bar_pixmap:     None,
             bar_cards:      vec![],
             bar_buttons:    vec![],
             bar_mouse_x:    0.0,
             bar_mouse_y:    0.0,
             panel_expanded: false,
+            toast: None,
+            launcher_zones: vec![],
         }
     }
 
     pub fn set_panel_expanded(&mut self, v: bool) { self.panel_expanded = v; }
 
-    pub fn update_theme(&mut self, t: Theme) { self.theme = t; }
+    /// Show an error toast for `duration_ms` milliseconds.
+    pub fn show_toast(&mut self, message: String, duration_ms: u32) {
+        self.toast = Some((message, std::time::Instant::now(), duration_ms));
+    }
+    /// Clear keyboard focus and search state — call when the overlay is hidden.
+    pub fn reset_kb(&mut self) {
+        self.kb_win        = None;
+        self.search_active = false;
+        self.search_query.clear();
+    }
+
+    pub fn update_theme(&mut self, t: Theme)         { self.theme  = t; }
+    pub fn update_layout(&mut self, l: LayoutConfig) { self.layout = l; }
+    pub fn update_icon_overrides(
+        &mut self,
+        map: std::collections::HashMap<String, String>,
+        default_icon: Option<String>,
+    ) {
+        for (class, path) in map {
+            self.icons.register_override(class, path);
+        }
+        if let Some(path) = default_icon {
+            self.icons.register_override_default(path);
+        }
+    }
+
+    pub fn update_app_rules(&mut self, rules: std::collections::HashMap<String, String>) {
+        self.app_rules.clear();
+        for (class, hex) in rules {
+            self.app_rules.insert(class.to_lowercase(), parse_color(&hex, 1.0));
+        }
+    }
+
+    /// Returns the accent color for an app class.
+    /// Checks `woven.rules()` first, falls back to the hash-based color.
+    fn app_color(&self, class: &str) -> Color {
+        self.app_rules.get(&class.to_lowercase())
+            .copied()
+            .unwrap_or_else(|| class_color(class))
+    }
+
+    pub fn register_widget(&mut self, def: WidgetDef) {
+        if let Some(entry) = self.bar_widgets.iter_mut().find(|(d,_)| d.id == def.id) {
+            entry.0 = def; // update definition, keep existing draw cmds
+        } else {
+            self.bar_widgets.push((def, vec![]));
+        }
+    }
+
+    pub fn update_widget_content(&mut self, id: String, cmds: Vec<DrawCmd>) {
+        if let Some(entry) = self.bar_widgets.iter_mut().find(|(d,_)| d.id == id) {
+            entry.1 = cmds;
+        }
+    }
     pub fn update_settings(&mut self, show_empty: bool) { self.show_empty = show_empty; }
 
     pub fn update_state(&mut self, ws: Vec<Workspace>, met: Vec<WorkspaceMetrics>) {
@@ -467,9 +554,129 @@ impl Painter {
     }
 
     pub fn next_page(&mut self) {
-        if self.selected_ws + 1 < self.workspaces.len() { self.selected_ws += 1; }
+        if self.selected_ws + 1 < self.workspaces.len() { self.selected_ws += 1; self.kb_win = None; }
     }
-    pub fn prev_page(&mut self) { if self.selected_ws > 0 { self.selected_ws -= 1; } }
+    pub fn prev_page(&mut self) {
+        if self.selected_ws > 0 { self.selected_ws -= 1; self.kb_win = None; }
+    }
+
+    /// Handle a key press. Returns `true` if the overlay should close.
+    pub fn on_key(&mut self, keysym: u32) -> bool {
+        const XKB_BACKSPACE: u32 = 0xff08;
+        const XKB_TAB:       u32 = 0xff09;
+        const XKB_RETURN:    u32 = 0xff0d;
+        const XKB_ESCAPE:    u32 = 0xff1b;
+        const XKB_SLASH:     u32 = 0x002f;
+        const XKB_LEFT:      u32 = 0xff51;
+        const XKB_UP:        u32 = 0xff52;
+        const XKB_RIGHT:     u32 = 0xff53;
+        const XKB_DOWN:      u32 = 0xff54;
+
+        if self.search_active {
+            // ── search mode ──────────────────────────────────────────────────
+            match keysym {
+                XKB_ESCAPE => {
+                    if self.search_query.is_empty() {
+                        self.search_active = false;
+                    } else {
+                        self.search_query.clear();
+                    }
+                    self.kb_win = None;
+                }
+                XKB_RETURN => {
+                    if let Some(idx) = self.kb_win {
+                        if let Some(card) = self.cards.get(idx) {
+                            let _ = self.action_tx.try_send(WindowAction::Focus(card.window_id.clone()));
+                        }
+                    }
+                    self.kb_win        = None;
+                    self.search_active = false;
+                    self.search_query.clear();
+                    return true; // close overlay
+                }
+                XKB_BACKSPACE => {
+                    self.search_query.pop();
+                    self.kb_win = None;
+                }
+                XKB_UP | XKB_LEFT => {
+                    let count = self.cards.len();
+                    if count > 0 {
+                        self.kb_win = Some(match self.kb_win {
+                            None    => count.saturating_sub(1),
+                            Some(0) => count - 1,
+                            Some(i) => i - 1,
+                        });
+                    }
+                }
+                XKB_DOWN | XKB_RIGHT | XKB_TAB => {
+                    let count = self.cards.len();
+                    if count > 0 {
+                        self.kb_win = Some(match self.kb_win {
+                            None    => 0,
+                            Some(i) => (i + 1) % count,
+                        });
+                    }
+                }
+                k @ 0x0020..=0x007e => {
+                    if let Some(ch) = char::from_u32(k) {
+                        self.search_query.push(ch);
+                        self.kb_win = None;
+                    }
+                }
+                _ => {} // ignore F-keys, modifiers, etc.
+            }
+            return false;
+        }
+
+        // ── normal mode ──────────────────────────────────────────────────────
+        let card_count = self.cards.len();
+        match keysym {
+            XKB_SLASH => {
+                self.search_active = true;
+                self.search_query.clear();
+                self.kb_win = None;
+            }
+            XKB_ESCAPE => {
+                self.kb_win = None;
+                return true;
+            }
+            XKB_RETURN => {
+                if let Some(idx) = self.kb_win {
+                    if let Some(card) = self.cards.get(idx) {
+                        let _ = self.action_tx.try_send(WindowAction::Focus(card.window_id.clone()));
+                    }
+                }
+                self.kb_win = None;
+                return true;
+            }
+            XKB_TAB | XKB_RIGHT | XKB_DOWN => {
+                if card_count > 0 {
+                    self.kb_win = Some(match self.kb_win {
+                        None    => 0,
+                        Some(i) => (i + 1) % card_count,
+                    });
+                }
+            }
+            XKB_LEFT | XKB_UP => {
+                if card_count > 0 {
+                    self.kb_win = Some(match self.kb_win {
+                        None    => card_count.saturating_sub(1),
+                        Some(0) => card_count - 1,
+                        Some(i) => i - 1,
+                    });
+                }
+            }
+            k @ 0x31..=0x39 => {
+                let idx = (k - 0x31) as usize;
+                if idx < self.workspaces.len() {
+                    self.selected_ws = idx;
+                    self.kb_win = None;
+                }
+            }
+            _ => return true, // any other key closes
+        }
+        false
+    }
     pub fn on_scroll(&mut self, _sx: f64, _dy: f64) {}
     pub fn on_motion(&mut self, x: f64, y: f64) { self.mouse_x = x as f32; self.mouse_y = y as f32; }
 
@@ -497,6 +704,17 @@ impl Painter {
         }
         for ws in &self.ws_thumbs.clone() {
             if ws.hit(mx, my) { self.selected_ws = ws.ws_idx; return false; }
+        }
+        // Launcher zones — spawn process and close overlay.
+        for zone in &self.launcher_zones.clone() {
+            if zone.hit(mx, my) {
+                let cmd = zone.cmd.clone();
+                let parts: Vec<&str> = cmd.split_whitespace().collect();
+                if let Some((prog, args)) = parts.split_first() {
+                    let _ = std::process::Command::new(prog).args(args).spawn();
+                }
+                return true;
+            }
         }
         // Don't let card clicks pass through when the preview panel is covering the main view.
         if self.expanded_ws.is_none() {
@@ -544,7 +762,12 @@ impl Painter {
 
         self.draw_top_bar(&mut pm, sw, sh);
         self.draw_ws_strip(&mut pm, sw, sh, &theme);
-        self.draw_main_view(&mut pm, sw, sh, &theme, anim_t);
+        if self.search_active {
+            let theme2 = theme.clone();
+            self.draw_search_results(&mut pm, sw, sh, &theme2);
+        } else {
+            self.draw_main_view(&mut pm, sw, sh, &theme, anim_t);
+        }
         self.draw_widget_bar(&mut pm, sw, sh, &theme);
 
         // ── panel animation ───────────────────────────────────────────────
@@ -565,6 +788,17 @@ impl Painter {
             self.draw_hover_popup(&mut pm, sw, sh, idx, &theme2);
         }
 
+        // ── error toast (always top z-order) ─────────────────────────────
+        let toast_expired = if let Some((ref msg, shown_at, dur_ms)) = self.toast {
+            if shown_at.elapsed().as_millis() as u32 >= dur_ms {
+                true
+            } else {
+                self.draw_toast(&mut pm, sw, sh, msg.clone(), &theme);
+                false
+            }
+        } else { false };
+        if toast_expired { self.toast = None; }
+
         if anim_t < 0.999 {
             let a_scale = (anim_t * 255.0) as u32;
             for px in pm.pixels_mut() {
@@ -580,9 +814,146 @@ impl Painter {
         result
     }
 
+    // ── search ────────────────────────────────────────────────────────────────
+
+    /// Collect windows matching the current query across all workspaces.
+    /// Returns owned data to avoid borrow conflicts when calling text.draw in the loop.
+    /// Empty query = return all windows.
+    fn search_results(&self) -> Vec<(woven_common::types::Window, String, u32)> {
+        let q = self.search_query.to_lowercase();
+        self.workspaces.iter()
+            .flat_map(|ws| ws.windows.iter().map(move |w| (w, ws)))
+            .filter(|(w, _)| {
+                q.is_empty()
+                    || w.class.to_lowercase().contains(&q)
+                    || w.title.to_lowercase().contains(&q)
+            })
+            .map(|(w, ws)| (w.clone(), ws.name.clone(), ws.id))
+            .collect()
+    }
+
+    fn draw_search_box(&mut self, pm: &mut Pixmap, sw: f32, y: f32, theme: &Theme) {
+        #[allow(non_snake_case)] let OUTER_PAD = self.layout.outer_padding;
+        let x = OUTER_PAD;
+        let w = sw - OUTER_PAD * 2.0;
+        let h = 40.0_f32;
+        let r = (theme.border_radius as f32).min(h / 2.0);
+        // Border
+        fill_rrect(pm, x - 1.5, y - 1.5, w + 3.0, h + 3.0, r + 1.5,
+                   parse_color(&theme.accent, 0.85));
+        // Background
+        fill_rrect(pm, x, y, w, h, r, parse_color(&theme.background, 0.92));
+        // Text content
+        let fs  = 15.0_f32;
+        let cy  = y + h / 2.0 - fs / 2.0;
+        let pad = 14.0_f32;
+        let prefix = "/ ";
+        let pw = self.text.draw(pm, prefix, x + pad, cy, fs,
+                                parse_color(&theme.accent, 0.60));
+        if self.search_query.is_empty() {
+            self.text.draw(pm, "type to search windows...", x + pad + pw, cy, fs,
+                           parse_color(&theme.text, 0.22));
+        } else {
+            let display = format!("{}_", self.search_query);
+            self.text.draw(pm, &display, x + pad + pw, cy, fs,
+                           parse_color(&theme.text, 1.0));
+        }
+    }
+
+    fn draw_search_results(&mut self, pm: &mut Pixmap, sw: f32, sh: f32, theme: &Theme) {
+        #[allow(non_snake_case)] let TOP_H      = self.layout.top_bar_height;
+        #[allow(non_snake_case)] let WS_STRIP_H = self.layout.ws_strip_height;
+        #[allow(non_snake_case)] let WIDGET_H   = self.layout.widget_bar_height;
+        #[allow(non_snake_case)] let OUTER_PAD  = self.layout.outer_padding;
+        let slide   = self.anim_slide;
+        let view_y  = TOP_H + WS_STRIP_H + slide;
+        let view_h  = (sh - TOP_H - WS_STRIP_H - WIDGET_H).max(20.0);
+        let box_h   = 40.0_f32;
+        let box_y   = view_y + 12.0;
+
+        self.draw_search_box(pm, sw, box_y, theme);
+
+        let results_y = box_y + box_h + 10.0;
+        let results_h = view_h - box_h - 22.0;
+        let row_h     = 52.0_f32;
+        let row_gap   = 6.0_f32;
+        let row_x     = OUTER_PAD;
+        let row_w     = sw - OUTER_PAD * 2.0;
+
+        let results = self.search_results();
+
+        if results.is_empty() && !self.search_query.is_empty() {
+            let msg = "no matching windows";
+            let mfs = 13.0_f32;
+            let mw  = self.text.measure(msg, mfs);
+            self.text.draw(pm, msg, sw / 2.0 - mw / 2.0,
+                           results_y + results_h / 2.0 - mfs / 2.0,
+                           mfs, parse_color(&theme.border, 0.35));
+            return;
+        }
+
+        let mut new_cards: Vec<CardRect> = Vec::new();
+        let mx = self.mouse_x;
+        let my = self.mouse_y;
+
+        for (i, (win, ws_name, ws_id)) in results.iter().enumerate() {
+            let ry = results_y + i as f32 * (row_h + row_gap);
+            if ry + row_h > results_y + results_h { break; }
+
+            let hovered    = mx >= row_x && mx <= row_x + row_w
+                          && my >= ry    && my <= ry + row_h;
+            let kb_focused = self.kb_win == Some(new_cards.len());
+            let r          = (theme.border_radius as f32).min(row_h / 2.0);
+
+            // Focus ring
+            if kb_focused {
+                fill_rrect(pm, row_x - 2.0, ry - 2.0, row_w + 4.0, row_h + 4.0, r + 2.0,
+                           parse_color(&theme.accent, 0.95));
+            }
+
+            // Card background
+            fill_rrect(pm, row_x, ry, row_w, row_h, r,
+                       parse_color(&theme.background, if hovered { 0.75 } else { 0.55 }));
+
+            // Left accent strip
+            fill_rrect(pm, row_x, ry, 3.0, row_h, 1.5, self.app_color(&win.class));
+
+            // App class + title
+            let text_x  = row_x + 14.0;
+            let name_fs = 13.0_f32;
+            let ttl_fs  = 11.0_f32;
+            let name_y  = ry + row_h / 2.0 - name_fs - 1.0;
+            let ttl_y   = ry + row_h / 2.0 + 2.0;
+            self.text.draw(pm, if win.class.is_empty() { "unknown" } else { &win.class },
+                           text_x, name_y, name_fs, parse_color(&theme.text, 1.0));
+            self.text.draw(pm, &truncate(&win.title, 48),
+                           text_x, ttl_y, ttl_fs, parse_color(&theme.text, 0.45));
+
+            // Workspace badge (right side)
+            let ws_label = if ws_name.is_empty() { format!("ws {}", ws_id) } else { ws_name.clone() };
+            let badge_fs  = 10.0_f32;
+            let badge_pad = 7.0_f32;
+            let badge_w   = self.text.measure(&ws_label, badge_fs) + badge_pad * 2.0;
+            let badge_h   = 18.0_f32;
+            let badge_x   = row_x + row_w - badge_w - 10.0;
+            let badge_y   = ry + row_h / 2.0 - badge_h / 2.0;
+            fill_rrect(pm, badge_x, badge_y, badge_w, badge_h, badge_h / 2.0,
+                       parse_color(&theme.accent, 0.18));
+            self.text.draw(pm, &ws_label,
+                           badge_x + badge_pad, badge_y + badge_h / 2.0 - badge_fs / 2.0,
+                           badge_fs, parse_color(&theme.accent, 0.80));
+
+            new_cards.push(CardRect { x: row_x, y: ry, w: row_w, h: row_h,
+                                       window_id: win.id.clone() });
+        }
+
+        self.cards.extend(new_cards);
+    }
+
     // ── top bar ───────────────────────────────────────────────────────────────
 
     fn draw_top_bar(&mut self, pm: &mut Pixmap, sw: f32, _sh: f32) {
+        #[allow(non_snake_case)] let TOP_H = self.layout.top_bar_height;
         let theme = self.theme.clone(); let sys = self.sys.clone();
         let slide = self.anim_slide; let bar_h = TOP_H;
         fill_rect(pm, 0.0, slide, sw, bar_h, parse_color(&theme.background, 0.88));
@@ -634,6 +1005,13 @@ impl Painter {
     // ── workspace strip ───────────────────────────────────────────────────────
 
     fn draw_ws_strip(&mut self, pm: &mut Pixmap, sw: f32, _sh: f32, theme: &Theme) {
+        #[allow(non_snake_case)] let TOP_H      = self.layout.top_bar_height;
+        #[allow(non_snake_case)] let WS_STRIP_H = self.layout.ws_strip_height;
+        #[allow(non_snake_case)] let STRIP_GAP  = self.layout.strip_gap;
+        #[allow(non_snake_case)] let WS_THUMB_W = self.layout.ws_thumb_width;
+        #[allow(non_snake_case)] let WS_THUMB_H = self.layout.ws_thumb_height;
+        #[allow(non_snake_case)] let WS_BTN_H   = self.layout.ws_btn_height;
+        #[allow(non_snake_case)] let OUTER_PAD  = self.layout.outer_padding;
         let slide = self.anim_slide;
         let strip_y = TOP_H + slide; let strip_h = WS_STRIP_H;
         let thumb_y = strip_y + 8.0;
@@ -734,6 +1112,12 @@ impl Painter {
     // ── main view ─────────────────────────────────────────────────────────────
 
     fn draw_main_view(&mut self, pm: &mut Pixmap, sw: f32, sh: f32, theme: &Theme, anim_t: f32) {
+        #[allow(non_snake_case)] let TOP_H            = self.layout.top_bar_height;
+        #[allow(non_snake_case)] let WS_STRIP_H       = self.layout.ws_strip_height;
+        #[allow(non_snake_case)] let WIDGET_H         = self.layout.widget_bar_height;
+        #[allow(non_snake_case)] let CARD_PAD         = self.layout.card_padding;
+        #[allow(non_snake_case)] let CARD_GAP         = self.layout.card_gap;
+        #[allow(non_snake_case)] let CARD_THUMB_RATIO = self.layout.card_thumb_ratio;
         let slide  = self.anim_slide;
         let view_y = TOP_H + WS_STRIP_H + slide;
         let view_h = (sh - TOP_H - WS_STRIP_H - WIDGET_H).max(20.0);
@@ -761,7 +1145,7 @@ impl Painter {
 
         // ── grid fallback (no compositor geometry) ────────────────────────────
         let cols = if sw >= 1800.0 {4} else if sw >= 1200.0 {3} else {2};
-        let rows = (windows.len() + cols - 1) / cols;
+        let rows = windows.len().div_ceil(cols);
         let grid_w = sw - CARD_PAD*2.0; let grid_h = view_h - CARD_PAD*2.0;
         let card_w = (grid_w - CARD_GAP*(cols as f32-1.0)) / cols as f32;
         let card_h = if rows > 0 { ((grid_h - CARD_GAP*(rows as f32-1.0)) / rows as f32).min(300.0) } else { 0.0 };
@@ -774,24 +1158,27 @@ impl Painter {
             let cx  = CARD_PAD + col as f32*(card_w+CARD_GAP);
             let cy  = view_y + CARD_PAD + row as f32*(card_h+CARD_GAP);
             let r   = (theme.border_radius as f32).min(card_w/2.0).min(card_h/2.0);
-            let hovered = mx >= cx && mx <= cx+card_w && my >= cy && my <= cy+card_h;
-            fill_rrect(pm, cx-1.0, cy-1.0, card_w+2.0, card_h+2.0, r+1.0,
-                       parse_color(&theme.border, if hovered {0.45} else {0.20}));
+            let hovered   = mx >= cx && mx <= cx+card_w && my >= cy && my <= cy+card_h;
+            let kb_focused = self.kb_win == Some(new_cards.len());
+            let border_col = if kb_focused { parse_color(&theme.accent, 0.95) }
+                             else { parse_color(&theme.border, if hovered {0.45} else {0.20}) };
+            let inset = if kb_focused { 2.0f32 } else { 1.0f32 };
+            fill_rrect(pm, cx-inset, cy-inset, card_w+inset*2.0, card_h+inset*2.0, r+inset, border_col);
             fill_rrect(pm, cx, cy, card_w, card_h, r,
                        parse_color(&theme.background, if hovered {0.88} else {0.72}));
             new_cards.push(CardRect { x: cx, y: cy, w: card_w, h: card_h, window_id: win.id.clone() });
             let thumb_h = card_h * CARD_THUMB_RATIO;
             let info_h  = card_h - thumb_h;
             if let Some((tw, th, ref rgba)) = self.thumbnails.get(&win.id).cloned() {
-                draw_thumbnail_clipped(pm, &rgba, tw, th, cx, cy, card_w, thumb_h, r);
+                draw_thumbnail_clipped(pm, rgba, tw, th, cx, cy, card_w, thumb_h, r);
             } else {
                 fill_rrect(pm, cx, cy, card_w, thumb_h, r,
-                           with_alpha(class_color(&win.class), 0.10));
+                           with_alpha(self.app_color(&win.class), 0.10));
                 self.draw_app_icon(pm, &win.class, cx, cy, card_w, thumb_h);
             }
             if hovered {
                 fill_rrect(pm, cx, cy, card_w, thumb_h, r, parse_color(&theme.background, 0.55));
-                let btn_h_ = (thumb_h*0.22).max(16.0).min(26.0);
+                let btn_h_ = (thumb_h*0.22).clamp(16.0, 26.0);
                 let btn_fs = (btn_h_*0.44).clamp(8.0, 11.0);
                 let btn_pad = 7.0f32; let btn_gap = 4.0f32;
                 let id = win.id.clone();
@@ -816,7 +1203,7 @@ impl Painter {
                 }
             }
             let info_y = cy + thumb_h + 4.0; let text_pad = 10.0f32;
-            let cls_col = class_color(&win.class);
+            let cls_col = self.app_color(&win.class);
             let name_fs = (info_h*0.32).clamp(9.0, 13.0);
             let title_fs = (name_fs*0.82).clamp(8.0, 11.0);
             fill_rrect(pm, cx, cy+thumb_h+1.0, 3.0, card_h-thumb_h-1.0, 1.5, cls_col);
@@ -882,11 +1269,14 @@ impl Painter {
             if ww < 4.0 || wh < 4.0 { continue; }
 
             let r   = 4.0f32.min(ww / 4.0).min(wh / 4.0);
-            let hov = mx >= wx && mx <= wx + ww && my >= wy && my <= wy + wh;
+            let hov        = mx >= wx && mx <= wx + ww && my >= wy && my <= wy + wh;
+            let kb_focused = self.kb_win == Some(new_cards.len());
+            let border_col = if kb_focused { parse_color(&theme.accent, 0.95) }
+                             else { parse_color(&theme.border, if hov { 0.65 } else { 0.30 }) };
+            let inset = if kb_focused { 2.5f32 } else { 1.5f32 };
 
             // Window border + fill.
-            fill_rrect(pm, wx - 1.5, wy - 1.5, ww + 3.0, wh + 3.0, r + 1.5,
-                       parse_color(&theme.border, if hov { 0.65 } else { 0.30 }));
+            fill_rrect(pm, wx - inset, wy - inset, ww + inset*2.0, wh + inset*2.0, r + inset, border_col);
             fill_rrect(pm, wx, wy, ww, wh, r, parse_color(&theme.background, 0.92));
 
             // Screencopy thumbnail (full card; title bar drawn on top).
@@ -895,7 +1285,7 @@ impl Painter {
                 draw_thumbnail_clipped(pm, rgba, tw, th, wx, wy, ww, thumb_h, r);
             } else {
                 fill_rrect(pm, wx, wy, ww, thumb_h, r,
-                           with_alpha(class_color(&win.class), 0.10));
+                           with_alpha(self.app_color(&win.class), 0.10));
                 if ww >= 50.0 && thumb_h >= 40.0 {
                     self.draw_app_icon(pm, &win.class, wx, wy, ww, thumb_h);
                 }
@@ -905,7 +1295,7 @@ impl Painter {
             if wh > 26.0 {
                 let lbl_y = wy + wh - 16.0;
                 fill_rect(pm, wx, lbl_y, ww, 16.0, parse_color(&theme.background, 0.78));
-                fill_rect(pm, wx, lbl_y, 2.5, 16.0, class_color(&win.class));
+                fill_rect(pm, wx, lbl_y, 2.5, 16.0, self.app_color(&win.class));
                 let lfs = 8.0f32;
                 let cls  = if win.class.is_empty() { "unknown" } else { &win.class };
                 self.text.draw(pm, &truncate(cls, 22), wx + 6.0, lbl_y + 8.0 - lfs / 2.0,
@@ -992,6 +1382,9 @@ impl Painter {
     // ── workspace preview panel ───────────────────────────────────────────────
 
     fn draw_ws_panel(&mut self, pm: &mut Pixmap, sw: f32, sh: f32, theme: &Theme) {
+        #[allow(non_snake_case)] let TOP_H      = self.layout.top_bar_height;
+        #[allow(non_snake_case)] let WS_STRIP_H = self.layout.ws_strip_height;
+        #[allow(non_snake_case)] let WIDGET_H   = self.layout.widget_bar_height;
         let t = self.panel_anim;
         let slide = self.anim_slide;
         let panel_y = TOP_H + WS_STRIP_H + slide;
@@ -1099,10 +1492,10 @@ impl Painter {
             BarPosition::Bottom => fill_rect(&mut pm, 0.0, 0.0, sw, 1.0, parse_color(&theme.border, 0.22)),
         }
 
-        if self.panel_expanded && is_vertical {
-            self.paint_bar_expanded_inner(&mut pm, sw, sh, &theme.clone());
+        if self.panel_expanded {
+            self.paint_bar_expanded_inner(&mut pm, sw, sh, is_vertical, &theme.clone());
         } else {
-            self.paint_bar_collapsed_inner(&mut pm, sw, sh, is_vertical, &theme.clone());
+            self.paint_bar_collapsed_inner(&mut pm, sw, sh, is_vertical, position, &theme.clone());
         }
 
         let result = rgba_to_argb(pm.data());
@@ -1112,7 +1505,7 @@ impl Painter {
 
     // ── collapsed bar (52 px strip) ──────────────────────────────────────────
 
-    fn paint_bar_collapsed_inner(&mut self, pm: &mut Pixmap, sw: f32, sh: f32, is_vertical: bool, theme: &Theme) {
+    fn paint_bar_collapsed_inner(&mut self, pm: &mut Pixmap, sw: f32, sh: f32, is_vertical: bool, position: &BarPosition, theme: &Theme) {
         let workspaces = self.workspaces.clone();
         let mx = self.bar_mouse_x; let my = self.bar_mouse_y;
         let pad = 6.0f32; let gap = 5.0f32;
@@ -1125,9 +1518,21 @@ impl Painter {
             let thumb_h = thumb_w;  // square cards — numbers read much better than 16:9
             let btn_sz  = thumb_w; let r = 5.0f32;
 
+            // Total height of Bottom-slot widgets (gap above each one).
+            let bottom_widgets_h: f32 = self.bar_widgets.iter()
+                .filter(|(d,_)| d.slot == WidgetSlot::Bottom)
+                .map(|(d,_)| d.height as f32 + gap)
+                .sum();
+            // Total height of Top-slot widgets (gap below each one).
+            let top_widgets_h: f32 = self.bar_widgets.iter()
+                .filter(|(d,_)| d.slot == WidgetSlot::Top)
+                .map(|(d,_)| d.height as f32 + gap)
+                .sum();
+
             // System info section height (below workspace cards, above hide button):
             //  separator(1) + clock(18) + cpu(12) + ram(12) + vol(12) + gap(4) + scratchpad(28) + gap(4) + hide(btn_sz) + pad
-            let sys_sec_h = 1.0 + 18.0 + 12.0 + 12.0 + 12.0 + 4.0 + 28.0 + gap + btn_sz + gap + pad;
+            let sys_sec_h = 1.0 + 18.0 + 12.0 + 12.0 + 12.0 + 4.0 + 28.0 + gap + btn_sz + gap + pad
+                + bottom_widgets_h;
 
             // Toggle overlay button — top
             let tog_y = pad;
@@ -1141,8 +1546,19 @@ impl Painter {
             new_bar_btns.push(ButtonRect { x: pad, y: tog_y, w: btn_sz, h: btn_sz,
                                            action: WindowAction::ToggleOverlay });
 
+            // ── Top-slot plugin widgets ───────────────────────────────────
+            let mut top_widget_y = tog_y + btn_sz + gap;
+            let top_widgets: Vec<(WidgetDef, Vec<DrawCmd>)> = self.bar_widgets.iter()
+                .filter(|(d,_)| d.slot == WidgetSlot::Top)
+                .cloned().collect();
+            for (def, cmds) in &top_widgets {
+                let wh = def.height as f32;
+                self.execute_draw_cmds(pm, pad, top_widget_y, thumb_w, wh, cmds, theme);
+                top_widget_y += wh + gap;
+            }
+
             // Workspace thumbnails
-            let ws_start_y = tog_y + btn_sz + gap + 4.0;
+            let ws_start_y = tog_y + btn_sz + gap + 4.0 + top_widgets_h;
             for (i, ws) in workspaces.iter().enumerate() {
                 let ty = ws_start_y + i as f32 * (thumb_h + gap);
                 if ty + thumb_h > sh - sys_sec_h { break; }
@@ -1178,6 +1594,20 @@ impl Painter {
                 }
                 if hov { fill_rrect(pm, pad, ty, thumb_w, thumb_h, r, parse_color(&theme.background, 0.18)); }
                 new_bar_cards.push(WsThumbRect { x: pad, y: ty, w: thumb_w, h: thumb_h, ws_idx: i });
+            }
+
+            // ── Bottom-slot plugin widgets ────────────────────────────────
+            // Anchored just above the system info separator.
+            let hide_y_approx = sh - btn_sz - pad;
+            let sys_start_approx = hide_y_approx - gap - 28.0 - 4.0 - 12.0 - 12.0 - 12.0 - 18.0 - 2.0;
+            let mut bot_widget_y = sys_start_approx - bottom_widgets_h;
+            let bottom_widgets: Vec<(WidgetDef, Vec<DrawCmd>)> = self.bar_widgets.iter()
+                .filter(|(d,_)| d.slot == WidgetSlot::Bottom)
+                .cloned().collect();
+            for (def, cmds) in &bottom_widgets {
+                let wh = def.height as f32;
+                self.execute_draw_cmds(pm, pad, bot_widget_y, thumb_w, wh, cmds, theme);
+                bot_widget_y += wh + gap;
             }
 
             // ── System info widgets ───────────────────────────────────────
@@ -1275,25 +1705,105 @@ impl Painter {
         } else {
             // Horizontal layout (top / bottom)
             let thumb_h = sh - pad*2.0;
-            let thumb_w = thumb_h;  // square cards here too
+            let thumb_w = thumb_h;  // square cards
             let btn_sz  = thumb_h; let r = 5.0f32;
 
-            // Toggle overlay button — left
-            let tog_hov = mx >= pad && mx <= pad+btn_sz && my >= pad && my <= pad+btn_sz;
-            fill_rrect(pm, pad, pad, btn_sz, btn_sz, r,
-                       parse_color(&theme.accent, if tog_hov {0.30} else {0.14}));
-            let (cx, cy, dr) = (pad+btn_sz/2.0, pad+btn_sz/2.0, 2.5f32);
-            for &dy in &[-4.0f32, 4.0] { for &dx in &[-4.0f32, 4.0] {
-                fill_circle(pm, cx+dx, cy+dy, dr, parse_color(&theme.accent, if tog_hov {0.9} else {0.5}));
-            }}
-            new_bar_btns.push(ButtonRect { x: pad, y: pad, w: btn_sz, h: btn_sz,
-                                           action: WindowAction::ToggleOverlay });
+            // ── Right-anchored section (expand btn + system info) ────────
+            // Laid out right-to-left so we know where workspace cards stop.
 
-            // Workspace thumbnails
-            let ws_start_x = pad + btn_sz + gap + 4.0;
+            let mut right_x = sw - pad; // cursor moving leftward
+
+            // Expand panel button — rightmost
+            right_x -= btn_sz;
+            let exp_x = right_x;
+            let exp_hov = mx >= exp_x && mx <= exp_x+btn_sz && my >= pad && my <= pad+btn_sz;
+            fill_rrect(pm, exp_x, pad, btn_sz, btn_sz, r,
+                       parse_color(&theme.accent, if exp_hov {0.30} else {0.14}));
+            let exp_lbl = if matches!(position, BarPosition::Bottom) { "↑" } else { "↓" };
+            let fs = 12.0f32; let lw = self.text.measure(exp_lbl, fs);
+            self.text.draw(pm, exp_lbl, exp_x+btn_sz/2.0-lw/2.0, pad+btn_sz/2.0-fs/2.0,
+                           fs, parse_color(&theme.accent, if exp_hov {1.0} else {0.55}));
+            new_bar_btns.push(ButtonRect { x: exp_x, y: pad, w: btn_sz, h: btn_sz,
+                                           action: WindowAction::ExpandPanel });
+            right_x -= gap;
+
+            // Separator before system info
+            fill_rect(pm, right_x, pad+4.0, 1.0, thumb_h-8.0,
+                      parse_color(&theme.border, 0.18));
+            right_x -= gap;
+
+            // Compact system info: clock | CPU | RAM | VOL
+            let sys = self.sys.clone();
+            let info_fs = 9.0f32;
+            let info_items: Vec<(String, tiny_skia::Color)> = vec![
+                (chrono::Local::now().format("%H:%M").to_string(),
+                 parse_color(&theme.text, 0.75)),
+                (format!("C{:.0}%", sys.cpu_pct),
+                 if sys.cpu_pct > 80.0 { Color::from_rgba8(243,139,168,200) }
+                 else if sys.cpu_pct > 50.0 { Color::from_rgba8(250,179,135,200) }
+                 else { parse_color(&theme.text, 0.50) }),
+                (format!("M{:.0}%", if sys.mem_total_kb > 0 {
+                    sys.mem_used_kb as f32 / sys.mem_total_kb as f32 * 100.0 } else { 0.0 }),
+                 parse_color(&theme.text, 0.50)),
+                (match sys.volume_pct { Some(v) => format!("V{:.0}%", v), None => "V--".into() },
+                 parse_color(&theme.text, 0.50)),
+            ];
+            for (label, col) in info_items.iter().rev() {
+                let tw = self.text.measure(label, info_fs);
+                right_x -= tw;
+                self.text.draw(pm, label, right_x, pad+thumb_h/2.0-info_fs/2.0,
+                               info_fs, *col);
+                right_x -= gap + 2.0;
+            }
+
+            // Separator after system info
+            fill_rect(pm, right_x, pad+4.0, 1.0, thumb_h-8.0,
+                      parse_color(&theme.border, 0.18));
+            right_x -= gap;
+
+            // ── Bottom-slot widgets (right side, before sys info) ─────────
+            let bottom_widgets: Vec<(WidgetDef, Vec<DrawCmd>)> = self.bar_widgets.iter()
+                .filter(|(d,_)| d.slot == WidgetSlot::Bottom)
+                .cloned().collect();
+            for (def, cmds) in bottom_widgets.iter().rev() {
+                let ww = def.height as f32; // use widget "height" as width in horizontal
+                right_x -= ww;
+                self.execute_draw_cmds(pm, right_x, pad, ww, thumb_h, cmds, theme);
+                right_x -= gap;
+            }
+
+            let ws_end_x = right_x; // workspace cards must not go past here
+
+            // ── Left-anchored section ────────────────────────────────────
+            let mut left_x = pad;
+
+            // Toggle overlay button — leftmost
+            let tog_hov = mx >= left_x && mx <= left_x+btn_sz && my >= pad && my <= pad+btn_sz;
+            fill_rrect(pm, left_x, pad, btn_sz, btn_sz, r,
+                       parse_color(&theme.accent, if tog_hov {0.30} else {0.14}));
+            let (cx, cy_dot, dr) = (left_x+btn_sz/2.0, pad+btn_sz/2.0, 2.5f32);
+            for &dy in &[-4.0f32, 4.0] { for &dx in &[-4.0f32, 4.0] {
+                fill_circle(pm, cx+dx, cy_dot+dy, dr, parse_color(&theme.accent, if tog_hov {0.9} else {0.5}));
+            }}
+            new_bar_btns.push(ButtonRect { x: left_x, y: pad, w: btn_sz, h: btn_sz,
+                                           action: WindowAction::ToggleOverlay });
+            left_x += btn_sz + gap;
+
+            // ── Top-slot widgets (left side, after toggle) ───────────────
+            let top_widgets: Vec<(WidgetDef, Vec<DrawCmd>)> = self.bar_widgets.iter()
+                .filter(|(d,_)| d.slot == WidgetSlot::Top)
+                .cloned().collect();
+            for (def, cmds) in &top_widgets {
+                let ww = def.height as f32; // use widget "height" as width in horizontal
+                self.execute_draw_cmds(pm, left_x, pad, ww, thumb_h, cmds, theme);
+                left_x += ww + gap;
+            }
+
+            // ── Workspace thumbnails (center area) ───────────────────────
+            let ws_start_x = left_x + 4.0;
             for (i, ws) in workspaces.iter().enumerate() {
                 let tx = ws_start_x + i as f32 * (thumb_w + gap);
-                if tx + thumb_w > sw - btn_sz - gap - pad { break; }
+                if tx + thumb_w > ws_end_x { break; }
                 let is_active = ws.active;
                 let hov = mx >= tx && mx <= tx+thumb_w && my >= pad && my <= pad+thumb_h;
                 let bw = if is_active { 2.0f32 } else { 1.0 };
@@ -1325,17 +1835,6 @@ impl Painter {
                 if is_active { fill_circle(pm, tx+thumb_w-5.0, pad+5.0, 3.0, parse_color(&theme.accent, 0.9)); }
                 new_bar_cards.push(WsThumbRect { x: tx, y: pad, w: thumb_w, h: thumb_h, ws_idx: i });
             }
-
-            // Expand panel button — right
-            let hide_x = sw - btn_sz - pad;
-            let exp_hov = mx >= hide_x && mx <= hide_x+btn_sz && my >= pad && my <= pad+btn_sz;
-            fill_rrect(pm, hide_x, pad, btn_sz, btn_sz, r,
-                       parse_color(&theme.accent, if exp_hov {0.30} else {0.14}));
-            let lbl = "↑"; let fs = 12.0f32; let lw = self.text.measure(lbl, fs);
-            self.text.draw(pm, lbl, hide_x+btn_sz/2.0-lw/2.0, pad+btn_sz/2.0-fs/2.0,
-                           fs, parse_color(&theme.accent, if exp_hov {1.0} else {0.55}));
-            new_bar_btns.push(ButtonRect { x: hide_x, y: pad, w: btn_sz, h: btn_sz,
-                                           action: WindowAction::ExpandPanel });
         }
 
         self.bar_cards   = new_bar_cards;
@@ -1344,7 +1843,16 @@ impl Painter {
 
     // ── expanded control center (300 px) ─────────────────────────────────────
 
-    fn paint_bar_expanded_inner(&mut self, pm: &mut Pixmap, sw: f32, _sh: f32, theme: &Theme) {
+    fn paint_bar_expanded_inner(&mut self, pm: &mut Pixmap, sw: f32, sh: f32, is_vertical: bool, theme: &Theme) {
+        if is_vertical {
+            self.paint_bar_expanded_vertical(pm, sw, sh, theme);
+        } else {
+            self.paint_bar_expanded_horizontal(pm, sw, sh, theme);
+        }
+    }
+
+    // ── Vertical expanded (300×screen_h column) ─────────────────────────────
+    fn paint_bar_expanded_vertical(&mut self, pm: &mut Pixmap, sw: f32, _sh: f32, theme: &Theme) {
         let sys = self.sys.clone();
         let mx  = self.bar_mouse_x; let my = self.bar_mouse_y;
         let pad = 14.0f32; let r = 8.0f32;
@@ -1371,7 +1879,6 @@ impl Painter {
 
         // ─── Header ──────────────────────────────────────────────────────────
         let hdr_h = 36.0f32;
-        // Logo — three dots
         let (lx, lcy, dr) = (pad + 8.0, cy + hdr_h/2.0, 3.0f32);
         for &dx in &[-5.0f32, 0.0, 5.0] {
             fill_circle(pm, lx+dx, lcy, dr, parse_color(&theme.accent, 0.65));
@@ -1380,7 +1887,6 @@ impl Painter {
         self.text.draw(pm, "woven", lx + 16.0, cy + hdr_h/2.0 - lbl_fs/2.0,
                        lbl_fs, parse_color(&theme.accent, 0.90));
 
-        // Right side buttons: [<] collapse, [—] hide
         let btn_h = 22.0f32; let btn_w = 30.0f32;
         let hide_x = sw - pad - btn_w;
         let hide_y = cy + hdr_h/2.0 - btn_h/2.0;
@@ -1403,7 +1909,6 @@ impl Painter {
         new_bar_btns.push(ButtonRect { x: coll_x, y: coll_y, w: btn_w, h: btn_h,
                                        action: WindowAction::CollapsePanel });
 
-        // Left side: overlay toggle dots button
         let tog_x = pad; let tog_y = cy + hdr_h/2.0 - btn_h/2.0; let tog_w = 28.0f32;
         let hov_tog = mx >= tog_x && mx <= tog_x+tog_w && my >= tog_y && my <= tog_y+btn_h;
         fill_rrect(pm, tog_x, tog_y, tog_w, btn_h, 5.0,
@@ -1437,9 +1942,8 @@ impl Painter {
         cy += date_fs + 4.0;
 
         if let Some(ref wx_str) = sys.weather {
-            // Strip leading/trailing whitespace and any + prefix before temp
             let clean: String = wx_str.chars()
-                .filter(|c| c.is_ascii() || *c == '\u{00B0}')  // keep ° but drop emoji
+                .filter(|c| c.is_ascii() || *c == '\u{00B0}')
                 .collect::<String>()
                 .trim()
                 .to_string();
@@ -1470,7 +1974,6 @@ impl Painter {
             self.text.draw(pm, &truncate(artist, 30), pad+text_pad, cy+10.0+tfs+3.0,
                            afs, parse_color(&theme.text, 0.55));
 
-            // ASCII media controls — use text that renders in any monospace font
             let play_lbl = if sys.media_playing { "||" } else { "> " };
             let media_btns: &[(&str, WindowAction)] = &[
                 ("|<", WindowAction::MediaPrev),
@@ -1522,14 +2025,12 @@ impl Painter {
                 let tx = pad + i as f32 * (tile_w + 8.0);
                 let hov = mx >= tx && mx <= tx+tile_w && my >= cy && my <= cy+tile_h;
                 let accent = parse_color(&theme.accent, if *active { if hov {0.35} else {0.22} }
-                                                        else       { if hov {0.18} else {0.10} });
+                                                        else if hov {0.18} else {0.10});
                 let border  = parse_color(&theme.accent, if *active {0.70} else {0.20});
                 fill_rrect(pm, tx-1.0, cy-1.0, tile_w+2.0, tile_h+2.0, r+1.0, border);
                 fill_rrect(pm, tx, cy, tile_w, tile_h, r, accent);
-                // label (small, top-left)
                 self.text.draw(pm, label, tx+9.0, cy+8.0, lbl_fs,
                                parse_color(&theme.text, 0.42));
-                // value (centred)
                 let vw = self.text.measure(value, val_fs);
                 let vc = if *active { parse_color(&theme.accent, 1.0) }
                          else { parse_color(&theme.text, 0.38) };
@@ -1565,7 +2066,6 @@ impl Painter {
                     let hov = mx >= bx && mx <= bx+bw && my >= cy && my <= cy+pbtn_h;
                     fill_rrect(pm, bx, cy, bw, pbtn_h, 6.0,
                                Color::from_rgba8(col[0],col[1],col[2], if hov {60} else {22}));
-                    // Coloured left accent stripe
                     fill_rrect(pm, bx, cy, 3.0, pbtn_h, 3.0,
                                Color::from_rgba8(col[0],col[1],col[2], if hov {200} else {110}));
                     let tw2 = self.text.measure(lbl, pbtn_fs);
@@ -1577,7 +2077,7 @@ impl Painter {
                 }
                 cy += pbtn_h + gap;
             }
-            cy -= gap; // undo last extra gap
+            cy -= gap;
         }
         sep!();
 
@@ -1585,10 +2085,9 @@ impl Painter {
         section!("WORKSPACES");
         {
             let workspaces = self.workspaces.clone();
-            // Compute card size to fill width evenly (min 42, max 56)
             let n = workspaces.len().max(1) as f32;
             let card_sz = ((inner_w - (n-1.0)*5.0) / n).clamp(38.0, 60.0);
-            let card_h  = card_sz + 14.0; // extra for window count label
+            let card_h  = card_sz + 14.0;
             let card_gap = 5.0f32;
             let total_w = n * card_sz + (n-1.0)*card_gap;
             let start_x = pad + (inner_w - total_w) / 2.0;
@@ -1597,7 +2096,6 @@ impl Painter {
                 let tx = start_x + i as f32 * (card_sz + card_gap);
                 let is_active = ws.active;
                 let hov = mx >= tx && mx <= tx+card_sz && my >= cy && my <= cy+card_h;
-                // border glow for active
                 if is_active {
                     fill_rrect(pm, tx-1.5, cy-1.5, card_sz+3.0, card_sz+3.0, 6.0,
                                parse_color(&theme.accent, 0.80));
@@ -1623,7 +2121,6 @@ impl Painter {
                                 else { parse_color(&theme.text, 0.30) };
                     self.text.draw(pm, &cnt_s, tx+card_sz/2.0-cw2/2.0, by+nfs+1.0, 9.0, cnt_c);
                 }
-                // Window count bar at bottom of card
                 if count > 0 {
                     let max_wins = 8usize;
                     let dot_r = 2.0f32; let dot_gap = 3.0f32;
@@ -1640,7 +2137,6 @@ impl Painter {
             }
             cy += card_h + 2.0;
 
-            // If no workspaces yet
             if workspaces.is_empty() {
                 let msg = "no workspaces"; let mfs = 10.0f32;
                 let mw = self.text.measure(msg, mfs);
@@ -1662,8 +2158,7 @@ impl Painter {
             let bar_y_off = row_h/2.0 - 4.0;
             let bar_h_px = 7.0f32;
 
-            // Helper closure draws one stat row
-            let mut draw_stat = |pm: &mut Pixmap,
+            let draw_stat = |pm: &mut Pixmap,
                                   text: &mut crate::text::TextRenderer,
                                   label: &str, pct: f32, col: Color, cy: f32| {
                 text.draw(pm, label, pad, cy + row_h/2.0 - stat_fs/2.0,
@@ -1688,7 +2183,6 @@ impl Painter {
             draw_stat(pm, &mut self.text, &cpu_lbl, cpu, cpu_col, cy);
             cy += row_h + bar_gap;
 
-            // GPU temp row (if we have it) — shown as a temp bar (treat 100C as max)
             if let Some(gt) = sys.gpu_temp_c {
                 let gpu_pct = (gt / 100.0 * 100.0).clamp(0.0, 100.0);
                 let gpu_col = if gt > 85.0 { Color::from_rgba8(243,139,168,210) }
@@ -1714,7 +2208,388 @@ impl Painter {
             let vol_pct = sys.volume_pct.unwrap_or(0.0);
             let vol_col = parse_color(&theme.accent, 0.65);
             draw_stat(pm, &mut self.text, "VOL", vol_pct, vol_col, cy);
-            // cy += row_h;
+            cy += row_h + bar_gap;
+        }
+
+        // ─── Panel-slot plugin widgets ─────────────────────────────────────────
+        let panel_widgets: Vec<(WidgetDef, Vec<DrawCmd>)> = self.bar_widgets.iter()
+            .filter(|(d, _)| d.slot == WidgetSlot::Panel)
+            .cloned().collect();
+        if !panel_widgets.is_empty() {
+            sep!();
+            section!("WIDGETS");
+            for (def, cmds) in &panel_widgets {
+                let wh = def.height as f32;
+                self.execute_draw_cmds(pm, pad, cy, inner_w, wh, cmds, &theme.clone());
+                cy += wh + 6.0;
+            }
+        }
+
+        self.bar_cards   = new_bar_cards;
+        self.bar_buttons = new_bar_btns;
+    }
+
+    // ── Horizontal expanded (screen_w × 300 multi-column) ───────────────────
+    fn paint_bar_expanded_horizontal(&mut self, pm: &mut Pixmap, sw: f32, sh: f32, theme: &Theme) {
+        let sys = self.sys.clone();
+        let mx  = self.bar_mouse_x; let my = self.bar_mouse_y;
+        let pad = 14.0f32; let r = 8.0f32;
+        let col_gap = 12.0f32;
+        let inner_h = sh - pad * 2.0;
+        let mut new_bar_btns:  Vec<ButtonRect>   = Vec::new();
+        let mut new_bar_cards: Vec<WsThumbRect>  = Vec::new();
+
+        // Split into 4 columns across the width
+        let ncols = 4.0f32;
+        let col_w = (sw - pad * 2.0 - col_gap * (ncols - 1.0)) / ncols;
+
+        // Helper: vertical separator between columns
+        let draw_col_sep = |pm: &mut Pixmap, x: f32| {
+            fill_rect(pm, x, pad + 6.0, 1.0, inner_h - 12.0,
+                      parse_color(&theme.border, 0.12));
+        };
+
+        // ═══════════════════════════════════════════════════════════════════
+        // COLUMN 1: Header + Clock/Date + Workspaces
+        // ═══════════════════════════════════════════════════════════════════
+        let c1_x = pad;
+        {
+            let mut cy = pad;
+
+            // Header row: logo + collapse/hide buttons
+            let hdr_h = 28.0f32;
+            let (lx, lcy, dr) = (c1_x + 8.0, cy + hdr_h/2.0, 3.0f32);
+            for &dx in &[-5.0f32, 0.0, 5.0] {
+                fill_circle(pm, lx+dx, lcy, dr, parse_color(&theme.accent, 0.65));
+            }
+            self.text.draw(pm, "woven", lx + 16.0, cy + hdr_h/2.0 - 6.5,
+                           13.0, parse_color(&theme.accent, 0.90));
+
+            // Collapse + hide buttons (right side of col 1)
+            let btn_h = 20.0f32; let btn_w = 26.0f32;
+            let hide_x = c1_x + col_w - btn_w;
+            let hide_y = cy + hdr_h/2.0 - btn_h/2.0;
+            let hov_hide = mx >= hide_x && mx <= hide_x+btn_w && my >= hide_y && my <= hide_y+btn_h;
+            fill_rrect(pm, hide_x, hide_y, btn_w, btn_h, 5.0,
+                       parse_color(&theme.border, if hov_hide {0.40} else {0.15}));
+            let lw = self.text.measure("--", 9.0);
+            self.text.draw(pm, "--", hide_x+btn_w/2.0-lw/2.0, hide_y+btn_h/2.0-4.5,
+                           9.0, parse_color(&theme.text, if hov_hide {0.9} else {0.45}));
+            new_bar_btns.push(ButtonRect { x: hide_x, y: hide_y, w: btn_w, h: btn_h,
+                                           action: WindowAction::HideBar });
+
+            let coll_x = hide_x - btn_w - 4.0;
+            let hov_coll = mx >= coll_x && mx <= coll_x+btn_w && my >= hide_y && my <= hide_y+btn_h;
+            fill_rrect(pm, coll_x, hide_y, btn_w, btn_h, 5.0,
+                       parse_color(&theme.accent, if hov_coll {0.30} else {0.13}));
+            let lw = self.text.measure("v", 11.0);
+            self.text.draw(pm, "v", coll_x+btn_w/2.0-lw/2.0, hide_y+btn_h/2.0-5.5,
+                           11.0, parse_color(&theme.accent, if hov_coll {1.0} else {0.60}));
+            new_bar_btns.push(ButtonRect { x: coll_x, y: hide_y, w: btn_w, h: btn_h,
+                                           action: WindowAction::CollapsePanel });
+
+            // Toggle overlay dots
+            let tog_x = c1_x; let tog_y = cy + hdr_h/2.0 - btn_h/2.0; let tog_w = 24.0f32;
+            let hov_tog = mx >= tog_x && mx <= tog_x+tog_w && my >= tog_y && my <= tog_y+btn_h;
+            fill_rrect(pm, tog_x, tog_y, tog_w, btn_h, 5.0,
+                       parse_color(&theme.accent, if hov_tog {0.28} else {0.12}));
+            let (dcx, dcy, ddr) = (tog_x+tog_w/2.0, tog_y+btn_h/2.0, 2.0f32);
+            for &ddy in &[-3.0f32, 3.0] { for &ddx in &[-3.0f32, 3.0] {
+                fill_circle(pm, dcx+ddx, dcy+ddy, ddr,
+                            parse_color(&theme.accent, if hov_tog {0.90} else {0.45}));
+            }}
+            new_bar_btns.push(ButtonRect { x: tog_x, y: tog_y, w: tog_w, h: btn_h,
+                                           action: WindowAction::ToggleOverlay });
+
+            cy += hdr_h + 8.0;
+
+            // Clock + Date
+            let now_local = chrono::Local::now();
+            let clock_str = now_local.format("%H:%M").to_string();
+            let date_str  = now_local.format("%A, %d %b").to_string();
+
+            let clock_fs = 32.0f32;
+            let cw = self.text.measure(&clock_str, clock_fs);
+            self.text.draw(pm, &clock_str, c1_x + col_w/2.0 - cw/2.0, cy, clock_fs,
+                           parse_color(&theme.text, 0.96));
+            cy += clock_fs + 3.0;
+
+            let date_fs = 11.0f32;
+            let dw = self.text.measure(&date_str, date_fs);
+            self.text.draw(pm, &date_str, c1_x + col_w/2.0 - dw/2.0, cy, date_fs,
+                           parse_color(&theme.text, 0.50));
+            cy += date_fs + 3.0;
+
+            if let Some(ref wx_str) = sys.weather {
+                let clean: String = wx_str.chars()
+                    .filter(|c| c.is_ascii() || *c == '\u{00B0}')
+                    .collect::<String>().trim().to_string();
+                if !clean.is_empty() {
+                    let wx_fs = 10.0f32;
+                    let ww = self.text.measure(&clean, wx_fs);
+                    self.text.draw(pm, &clean, c1_x + col_w/2.0 - ww/2.0, cy, wx_fs,
+                                   parse_color(&theme.text, 0.38));
+                    cy += wx_fs + 2.0;
+                }
+            }
+            cy += 8.0;
+
+            // Workspaces row
+            let sec_fs = 9.0f32;
+            self.text.draw(pm, "WORKSPACES", c1_x, cy, sec_fs, parse_color(&theme.text, 0.30));
+            cy += sec_fs + 5.0;
+            {
+                let workspaces = self.workspaces.clone();
+                let n = workspaces.len().max(1) as f32;
+                let card_sz = ((col_w - (n-1.0)*5.0) / n).clamp(30.0, 50.0);
+                let card_h = card_sz + 12.0;
+                let card_gap = 4.0f32;
+                let total = n * card_sz + (n-1.0)*card_gap;
+                let start = c1_x + (col_w - total) / 2.0;
+
+                for (i, ws) in workspaces.iter().enumerate() {
+                    let tx = start + i as f32 * (card_sz + card_gap);
+                    if tx + card_sz > c1_x + col_w { break; }
+                    let is_active = ws.active;
+                    let hov = mx >= tx && mx <= tx+card_sz && my >= cy && my <= cy+card_h;
+                    if is_active {
+                        fill_rrect(pm, tx-1.5, cy-1.5, card_sz+3.0, card_sz+3.0, 5.0,
+                                   parse_color(&theme.accent, 0.80));
+                    }
+                    fill_rrect(pm, tx, cy, card_sz, card_sz, 4.0,
+                               parse_color(&theme.background, if is_active {0.15} else if hov {0.60} else {0.45}));
+                    if is_active {
+                        fill_rrect(pm, tx, cy, card_sz, card_sz, 4.0,
+                                   parse_color(&theme.accent, 0.18));
+                    }
+                    let num = format!("{}", ws.id);
+                    let nfs = 12.0f32; let nw = self.text.measure(&num, nfs);
+                    let nc = if is_active { parse_color(&theme.accent, 1.0) }
+                             else { parse_color(&theme.text, if hov {0.85} else {0.60}) };
+                    self.text.draw(pm, &num, tx+card_sz/2.0-nw/2.0, cy+card_sz/2.0-nfs/2.0, nfs, nc);
+                    new_bar_cards.push(WsThumbRect { x: tx, y: cy, w: card_sz, h: card_h, ws_idx: i });
+                }
+            }
+        }
+
+        draw_col_sep(pm, c1_x + col_w + col_gap/2.0);
+
+        // ═══════════════════════════════════════════════════════════════════
+        // COLUMN 2: Media + Connectivity
+        // ═══════════════════════════════════════════════════════════════════
+        let c2_x = c1_x + col_w + col_gap;
+        {
+            let mut cy = pad;
+
+            // Media
+            let has_media = sys.media_title.is_some() || sys.media_artist.is_some();
+            if has_media {
+                let sec_fs = 9.0f32;
+                self.text.draw(pm, "NOW PLAYING", c2_x, cy, sec_fs, parse_color(&theme.text, 0.30));
+                cy += sec_fs + 5.0;
+
+                let card_h = 65.0f32;
+                fill_rrect(pm, c2_x, cy, col_w, card_h, r,
+                           parse_color(&theme.background, 0.45));
+
+                let title  = sys.media_title.as_deref().unwrap_or("Unknown");
+                let artist = sys.media_artist.as_deref().unwrap_or("");
+                self.text.draw(pm, &truncate(title, 30), c2_x+10.0, cy+8.0,
+                               11.0, parse_color(&theme.text, 0.92));
+                self.text.draw(pm, &truncate(artist, 34), c2_x+10.0, cy+22.0,
+                               9.5, parse_color(&theme.text, 0.55));
+
+                let play_lbl = if sys.media_playing { "||" } else { "> " };
+                let media_btns: &[(&str, WindowAction)] = &[
+                    ("|<", WindowAction::MediaPrev),
+                    (play_lbl, WindowAction::MediaPlayPause),
+                    (">|", WindowAction::MediaNext),
+                ];
+                let mbtn_w = 34.0f32; let mbtn_h = 18.0f32;
+                let total = 3.0 * mbtn_w + 2.0 * 5.0;
+                let mbtn_x0 = c2_x + col_w/2.0 - total/2.0;
+                let mbtn_y = cy + card_h - mbtn_h - 6.0;
+                for (i, (lbl, action)) in media_btns.iter().enumerate() {
+                    let bx = mbtn_x0 + i as f32 * (mbtn_w + 5.0);
+                    let hov = mx >= bx && mx <= bx+mbtn_w && my >= mbtn_y && my <= mbtn_y+mbtn_h;
+                    fill_rrect(pm, bx, mbtn_y, mbtn_w, mbtn_h, 4.0,
+                               parse_color(&theme.accent, if hov {0.35} else {0.16}));
+                    let lfs = if *lbl == "> " || *lbl == "||" { 10.0f32 } else { 9.0f32 };
+                    let lw2 = self.text.measure(lbl, lfs);
+                    self.text.draw(pm, lbl, bx+mbtn_w/2.0-lw2/2.0, mbtn_y+mbtn_h/2.0-lfs/2.0,
+                                   lfs, parse_color(&theme.accent, if hov {1.0} else {0.72}));
+                    new_bar_btns.push(ButtonRect { x: bx, y: mbtn_y, w: mbtn_w, h: mbtn_h,
+                                                   action: action.clone() });
+                }
+                cy += card_h + 10.0;
+            }
+
+            // Connectivity
+            let sec_fs = 9.0f32;
+            self.text.draw(pm, "CONNECTIVITY", c2_x, cy, sec_fs, parse_color(&theme.text, 0.30));
+            cy += sec_fs + 5.0;
+            {
+                let tile_h = 48.0f32;
+                let tile_w = (col_w - 6.0) / 2.0;
+
+                let tiles: &[(&str, &str, bool, WindowAction)] = &[
+                    ("WiFi",
+                     &sys.wifi_ssid.as_deref()
+                         .map(|s| truncate(s, 10))
+                         .unwrap_or_else(|| "Off".into()),
+                     sys.wifi_ssid.is_some(),
+                     WindowAction::WifiToggle),
+                    ("Bluetooth",
+                     if sys.bt_on { "On" } else { "Off" },
+                     sys.bt_on,
+                     WindowAction::BtToggle),
+                ];
+
+                for (i, (label, value, active, action)) in tiles.iter().enumerate() {
+                    let tx = c2_x + i as f32 * (tile_w + 6.0);
+                    let hov = mx >= tx && mx <= tx+tile_w && my >= cy && my <= cy+tile_h;
+                    let accent = parse_color(&theme.accent, if *active { if hov {0.35} else {0.22} }
+                                                            else if hov {0.18} else {0.10});
+                    let border = parse_color(&theme.accent, if *active {0.70} else {0.20});
+                    fill_rrect(pm, tx-1.0, cy-1.0, tile_w+2.0, tile_h+2.0, r+1.0, border);
+                    fill_rrect(pm, tx, cy, tile_w, tile_h, r, accent);
+                    self.text.draw(pm, label, tx+8.0, cy+7.0, 8.0, parse_color(&theme.text, 0.42));
+                    let vw = self.text.measure(value, 10.0);
+                    let vc = if *active { parse_color(&theme.accent, 1.0) }
+                             else { parse_color(&theme.text, 0.38) };
+                    self.text.draw(pm, value, tx+tile_w/2.0-vw/2.0, cy+tile_h/2.0-5.0+3.0,
+                                   10.0, vc);
+                    new_bar_btns.push(ButtonRect { x: tx, y: cy, w: tile_w, h: tile_h,
+                                                   action: action.clone() });
+                }
+            }
+        }
+
+        draw_col_sep(pm, c2_x + col_w + col_gap/2.0);
+
+        // ═══════════════════════════════════════════════════════════════════
+        // COLUMN 3: System stats
+        // ═══════════════════════════════════════════════════════════════════
+        let c3_x = c2_x + col_w + col_gap;
+        {
+            let mut cy = pad;
+            let sec_fs = 9.0f32;
+            self.text.draw(pm, "SYSTEM", c3_x, cy, sec_fs, parse_color(&theme.text, 0.30));
+            cy += sec_fs + 5.0;
+
+            let row_h = 22.0f32; let bar_gap = 7.0f32;
+            let lbl_w = 50.0f32; let stat_fs = 9.0f32;
+            let val_w = 30.0f32;
+            let track_x = c3_x + lbl_w + 4.0;
+            let track_w = col_w - lbl_w - 4.0 - val_w;
+            let val_x = track_x + track_w + 4.0;
+            let bar_y_off = row_h/2.0 - 4.0;
+            let bar_h_px = 7.0f32;
+
+            let draw_stat = |pm: &mut Pixmap,
+                                  text: &mut crate::text::TextRenderer,
+                                  label: &str, pct: f32, col: Color, cy: f32| {
+                text.draw(pm, label, c3_x, cy + row_h/2.0 - stat_fs/2.0,
+                          stat_fs, parse_color(&theme.text, 0.42));
+                fill_rrect(pm, track_x, cy+bar_y_off, track_w, bar_h_px, bar_h_px/2.0,
+                           parse_color(&theme.border, 0.20));
+                let fw = (track_w * pct.clamp(0.0,100.0) / 100.0).max(0.0);
+                if fw >= 1.0 { fill_rrect(pm, track_x, cy+bar_y_off, fw, bar_h_px, bar_h_px/2.0, col); }
+                let pct_s = format!("{:.0}%", pct);
+                let pw = text.measure(&pct_s, stat_fs);
+                text.draw(pm, &pct_s, val_x + val_w - pw, cy + row_h/2.0 - stat_fs/2.0,
+                          stat_fs, col);
+            };
+
+            let cpu = sys.cpu_pct;
+            let cpu_col = if cpu > 80.0 { Color::from_rgba8(243,139,168,210) }
+                          else if cpu > 50.0 { Color::from_rgba8(250,179,135,210) }
+                          else { parse_color(&theme.accent, 0.85) };
+            let cpu_lbl = if let Some(t) = sys.cpu_temp_c {
+                format!("CPU {:.0}C", t)
+            } else { "CPU".into() };
+            draw_stat(pm, &mut self.text, &cpu_lbl, cpu, cpu_col, cy);
+            cy += row_h + bar_gap;
+
+            if let Some(gt) = sys.gpu_temp_c {
+                let gpu_pct = (gt / 100.0 * 100.0).clamp(0.0, 100.0);
+                let gpu_col = if gt > 85.0 { Color::from_rgba8(243,139,168,210) }
+                              else if gt > 65.0 { Color::from_rgba8(250,179,135,210) }
+                              else { Color::from_rgba8(137,220,235,210) };
+                let gpu_lbl = format!("GPU {:.0}C", gt);
+                draw_stat(pm, &mut self.text, &gpu_lbl, gpu_pct, gpu_col, cy);
+                cy += row_h + bar_gap;
+            }
+
+            let ram_pct = if sys.mem_total_kb > 0 {
+                sys.mem_used_kb as f32 / sys.mem_total_kb as f32 * 100.0
+            } else { 0.0 };
+            let ram_col = if ram_pct > 85.0 { Color::from_rgba8(243,139,168,210) }
+                          else { parse_color(&theme.text, 0.52) };
+            let ram_lbl = format!("RAM {:.1}G", sys.mem_used_kb as f32 / (1024.0*1024.0));
+            draw_stat(pm, &mut self.text, &ram_lbl, ram_pct, ram_col, cy);
+            cy += row_h + bar_gap;
+
+            let vol_pct = sys.volume_pct.unwrap_or(0.0);
+            draw_stat(pm, &mut self.text, "VOL", vol_pct, parse_color(&theme.accent, 0.65), cy);
+            cy += row_h + bar_gap + 8.0;
+
+            // Panel-slot plugin widgets
+            let panel_widgets: Vec<(WidgetDef, Vec<DrawCmd>)> = self.bar_widgets.iter()
+                .filter(|(d, _)| d.slot == WidgetSlot::Panel)
+                .cloned().collect();
+            if !panel_widgets.is_empty() {
+                self.text.draw(pm, "WIDGETS", c3_x, cy, sec_fs, parse_color(&theme.text, 0.30));
+                cy += sec_fs + 5.0;
+                for (def, cmds) in &panel_widgets {
+                    let wh = def.height as f32;
+                    self.execute_draw_cmds(pm, c3_x, cy, col_w, wh, cmds, &theme.clone());
+                    cy += wh + 6.0;
+                }
+            }
+        }
+
+        draw_col_sep(pm, c3_x + col_w + col_gap/2.0);
+
+        // ═══════════════════════════════════════════════════════════════════
+        // COLUMN 4: Power
+        // ═══════════════════════════════════════════════════════════════════
+        let c4_x = c3_x + col_w + col_gap;
+        {
+            let mut cy = pad;
+            let sec_fs = 9.0f32;
+            self.text.draw(pm, "POWER", c4_x, cy, sec_fs, parse_color(&theme.text, 0.30));
+            cy += sec_fs + 5.0;
+
+            let pbtn_h = 30.0f32; let pbtn_fs = 9.5f32; let gap = 5.0f32;
+            let all_btns: &[(&str, WindowAction, [u8;3])] = &[
+                ("Suspend",  WindowAction::PowerSuspend,  [166,227,161]),
+                ("Lock",     WindowAction::PowerLock,     [137,180,250]),
+                ("Reboot",   WindowAction::PowerReboot,   [250,179,135]),
+                ("Logout",   WindowAction::PowerLogout,   [203,166,247]),
+                ("Shutdown", WindowAction::PowerShutdown, [243,139,168]),
+            ];
+            // 2 per row
+            let per_row = 2;
+            for (idx, (lbl, action, col)) in all_btns.iter().enumerate() {
+                let col_idx = idx % per_row;
+                let bw = (col_w - gap) / per_row as f32;
+                let bx = c4_x + col_idx as f32 * (bw + gap);
+                let hov = mx >= bx && mx <= bx+bw && my >= cy && my <= cy+pbtn_h;
+                fill_rrect(pm, bx, cy, bw, pbtn_h, 6.0,
+                           Color::from_rgba8(col[0],col[1],col[2], if hov {60} else {22}));
+                fill_rrect(pm, bx, cy, 3.0, pbtn_h, 3.0,
+                           Color::from_rgba8(col[0],col[1],col[2], if hov {200} else {110}));
+                let tw2 = self.text.measure(lbl, pbtn_fs);
+                self.text.draw(pm, lbl, bx+bw/2.0-tw2/2.0+2.0, cy+pbtn_h/2.0-pbtn_fs/2.0,
+                               pbtn_fs, Color::from_rgba8(col[0],col[1],col[2],
+                                                           if hov {240} else {170}));
+                new_bar_btns.push(ButtonRect { x: bx, y: cy, w: bw, h: pbtn_h,
+                                               action: action.clone() });
+                if col_idx == per_row - 1 || idx == all_btns.len() - 1 {
+                    cy += pbtn_h + gap;
+                }
+            }
         }
 
         self.bar_cards   = new_bar_cards;
@@ -1742,6 +2617,82 @@ impl Painter {
 
     // ── app icon ──────────────────────────────────────────────────────────────
 
+    /// Execute a plugin widget's draw command list onto `pm`, offset by (ox, oy).
+    /// Commands use canvas-local coordinates (0,0 = top-left of the widget area).
+    #[allow(clippy::too_many_arguments)]
+    fn execute_draw_cmds(
+        &mut self, pm: &mut Pixmap,
+        ox: f32, oy: f32, canvas_w: f32, canvas_h: f32,
+        cmds: &[DrawCmd], theme: &Theme,
+    ) {
+        // Clip guard — don't paint outside the canvas rect.
+        let x1 = ox; let y1 = oy; let x2 = ox + canvas_w; let y2 = oy + canvas_h;
+        if canvas_w < 1.0 || canvas_h < 1.0 { return; }
+
+        for cmd in cmds {
+            match cmd {
+                DrawCmd::Clear { color, alpha } => {
+                    let col = parse_color(color, *alpha);
+                    fill_rrect(pm, x1, y1, canvas_w, canvas_h, 4.0, col);
+                }
+                DrawCmd::FillRect { x, y, w, h, color, alpha, radius } => {
+                    let px = (ox + x).max(x1); let py = (oy + y).max(y1);
+                    let pw = (w.min(x2 - px)).max(0.0);
+                    let ph = (h.min(y2 - py)).max(0.0);
+                    if pw > 0.0 && ph > 0.0 {
+                        fill_rrect(pm, px, py, pw, ph, *radius, parse_color(color, *alpha));
+                    }
+                }
+                DrawCmd::Text { content, x, y, size, color, alpha } => {
+                    let px = ox + x; let py = oy + y;
+                    if px < x2 && py < y2 {
+                        self.text.draw(pm, content, px, py, *size, parse_color(color, *alpha));
+                    }
+                }
+                DrawCmd::TextCentered { content, y, size, color, alpha } => {
+                    let tw  = self.text.measure(content, *size);
+                    let px  = ox + (canvas_w / 2.0 - tw / 2.0).max(0.0);
+                    let py  = oy + y;
+                    if px < x2 && py < y2 {
+                        self.text.draw(pm, content, px, py, *size, parse_color(color, *alpha));
+                    }
+                }
+                DrawCmd::AppIcon { class, x, y, size } => {
+                    let px = if *x < 0.0 { ox + canvas_w / 2.0 - size / 2.0 } else { ox + x };
+                    let py = oy + y;
+                    // Render icon at full `size` — skip draw_app_icon's 0.45 scaling.
+                    if let Some((iw, ih, rgba)) = self.icons.get(class).cloned() {
+                        draw_icon_rgba(pm, &rgba, iw, ih, px, py, *size, *size);
+                    } else {
+                        let col = self.app_color(class);
+                        fill_circle(pm, px + size/2.0, py + size/2.0, size/2.0,
+                                    with_alpha(col, 0.22));
+                        let letter = class.chars().find(|c| c.is_alphabetic())
+                            .map(|c| c.to_uppercase().to_string())
+                            .unwrap_or_else(|| "?".into());
+                        let lfs = size * 0.55;
+                        let lw  = self.text.measure(&letter, lfs);
+                        self.text.draw(pm, &letter,
+                                       px + size/2.0 - lw/2.0, py + size/2.0 - lfs/2.0,
+                                       lfs, with_alpha(col, 0.85));
+                    }
+                }
+                DrawCmd::Circle { cx, cy, r, color, alpha } => {
+                    let px = ox + cx; let py = oy + cy;
+                    if px >= x1 && px <= x2 && py >= y1 && py <= y2 {
+                        fill_circle(pm, px, py, *r, parse_color(color, *alpha));
+                    }
+                }
+            }
+        }
+
+        // Subtle border so the widget area is visually separated.
+        if !cmds.is_empty() {
+            fill_rrect(pm, x1-0.5, y1-0.5, canvas_w+1.0, canvas_h+1.0, 4.5,
+                       parse_color(&theme.border, 0.12));
+        }
+    }
+
     fn draw_app_icon(&mut self, pm: &mut Pixmap, class: &str, cx: f32, cy: f32, cw: f32, ch: f32) {
         let icon_size = (ch * 0.45).clamp(24.0, 72.0) as u32;
         let ix = cx + cw/2.0 - icon_size as f32/2.0;
@@ -1751,7 +2702,7 @@ impl Painter {
             return;
         }
         // Letter fallback — no glyphs, no dollar signs
-        let col = class_color(class);
+        let col = self.app_color(class);
         fill_circle(pm, cx+cw/2.0, cy+ch/2.0, icon_size as f32/2.0, with_alpha(col, 0.22));
         let letter = class.chars().find(|c| c.is_alphabetic())
         .map(|c| c.to_uppercase().to_string()).unwrap_or_else(|| "?".into());
@@ -1764,6 +2715,7 @@ impl Painter {
     // ── widget bar ────────────────────────────────────────────────────────────
 
     fn draw_widget_bar(&mut self, pm: &mut Pixmap, sw: f32, sh: f32, theme: &Theme) {
+        #[allow(non_snake_case)] let WIDGET_H = self.layout.widget_bar_height;
         let slide = self.anim_slide; let bar_y = sh - WIDGET_H + slide;
         fill_rect(pm, 0.0, bar_y-1.0, sw, 1.0, parse_color(&theme.border, 0.15));
         fill_rect(pm, 0.0, bar_y, sw, WIDGET_H, parse_color(&theme.background, 0.55));
@@ -1786,11 +2738,67 @@ impl Painter {
             let rx = sw - pad - self.text.measure(&cnt, cfs);
             self.text.draw(pm, &cnt, rx, cy-cfs/2.0, cfs, parse_color(&theme.text, 0.35));
         }
+
+        // Overlay-slot plugin widgets — fixed-width slots centered in the zone.
+        let overlay_widgets: Vec<(WidgetDef, Vec<DrawCmd>)> = self.bar_widgets.iter()
+            .filter(|(d, _)| d.slot == WidgetSlot::Overlay)
+            .cloned().collect();
+        self.launcher_zones.clear();
+        if !overlay_widgets.is_empty() {
+            let zone_x  = 200.0f32;
+            let zone_w  = (sw - 400.0).max(100.0);
+            let wh      = WIDGET_H - 6.0;
+            let n       = overlay_widgets.len() as f32;
+            // Cap each slot at 260px wide; centre the group within the zone.
+            let slot_w  = (zone_w / n).min(260.0).floor();
+            let group_w = slot_w * n;
+            let group_x = (zone_x + (zone_w - group_w) / 2.0).floor();
+            let theme2  = theme.clone();
+            for (i, (def, cmds)) in overlay_widgets.iter().enumerate() {
+                let wx = group_x + i as f32 * slot_w;
+                let wy = bar_y + 3.0;
+                self.execute_draw_cmds(pm, wx, wy, slot_w - 8.0, wh, cmds, &theme2);
+                if let Some(cmd) = &def.onclick_cmd {
+                    self.launcher_zones.push(LaunchZone {
+                        x: wx, y: wy, w: slot_w - 8.0, h: wh,
+                        cmd: cmd.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    // ── error toast ───────────────────────────────────────────────────────────
+
+    fn draw_toast(&mut self, pm: &mut Pixmap, sw: f32, sh: f32, msg: String, theme: &Theme) {
+        let pad   = 16.0_f32;
+        let h     = 44.0_f32;
+        let w     = (sw - pad * 6.0).min(640.0_f32);
+        let x     = (sw - w) / 2.0;
+        let y     = sh - h - pad * 2.0;
+        // dark red-tinted background
+        let bg    = parse_color("#2a1520", 0.96);
+        let border = parse_color("#f38ba8", 1.0); // red accent (catppuccin red)
+        fill_rrect(pm, x, y, w, h, 8.0, bg);
+        // 2px border
+        fill_rrect(pm, x,     y,     w,   2.0, 0.0, border);
+        fill_rrect(pm, x,     y+h-2.0, w, 2.0, 0.0, border);
+        fill_rrect(pm, x,     y,     2.0, h,   0.0, border);
+        fill_rrect(pm, x+w-2.0, y,   2.0, h,   0.0, border);
+        // icon
+        let icon_col = parse_color("#f38ba8", 1.0);
+        self.text.draw(pm, "⚠", x + pad, y + h / 2.0 + 5.0, 15.0, icon_col);
+        // message (truncated to fit)
+        let max_chars = ((w - pad * 3.5 - 16.0) / 7.5) as usize;
+        let label = truncate(&msg, max_chars.max(20));
+        let text_col = parse_color(&theme.text, 0.95);
+        self.text.draw(pm, &label, x + pad + 22.0, y + h / 2.0 + 5.0, 12.5, text_col);
     }
 }
 
 // ── workspace placeholder ─────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn draw_ws_placeholder(
     pm: &mut Pixmap, text: &mut TextRenderer,
     tx: f32, ty: f32, tw: f32, th: f32, ws: &Workspace, theme: &Theme,
@@ -1813,10 +2821,10 @@ fn draw_ws_placeholder(
 fn epoch_ymd(epoch: u64) -> (u32, u32, u32) {
     let mut d = (epoch/86400) as u32; let mut y = 1970u32;
     loop {
-        let dy = if y%4==0 && (y%100!=0||y%400==0) {366} else {365};
+        let dy = if y.is_multiple_of(4) && (!y.is_multiple_of(100)||y.is_multiple_of(400)) {366} else {365};
         if d < dy { break; } d -= dy; y += 1;
     }
-    let leap = y%4==0 && (y%100!=0||y%400==0);
+    let leap = y.is_multiple_of(4) && (!y.is_multiple_of(100)||y.is_multiple_of(400));
     let ml = [31u32, if leap {29} else {28}, 31,30,31,30,31,31,30,31,30,31];
     let mut mo = 1u32;
     for mlen in ml { if d < mlen { break; } d -= mlen; mo += 1; }
@@ -1895,6 +2903,7 @@ fn rgba_to_argb(rgba: &[u8]) -> Vec<u8> {
 }
 
 /// Blit XRGB8888 screenshot at reduced brightness as overlay backdrop.
+#[allow(clippy::too_many_arguments)]
 fn draw_thumbnail_dimmed(
     pm: &mut Pixmap, src: &[u8], sw: u32, sh: u32,
     bx: f32, by: f32, bw: f32, bh: f32, dim: f32,
@@ -1926,6 +2935,7 @@ fn draw_thumbnail_dimmed(
 }
 
 /// Blit XRGB8888 thumbnail with rounded-corner clip.
+#[allow(clippy::too_many_arguments)]
 fn draw_thumbnail_clipped(
     pm: &mut Pixmap, src: &[u8], sw: u32, sh: u32,
     bx: f32, by: f32, bw: f32, bh: f32, r: f32,
@@ -1960,6 +2970,7 @@ fn draw_thumbnail_clipped(
 }
 
 /// Blit RGBA icon with source-over alpha compositing.
+#[allow(clippy::too_many_arguments)]
 fn draw_icon_rgba(
     pm: &mut Pixmap, src: &[u8], sw: u32, sh: u32,
     bx: f32, by: f32, bw: f32, bh: f32,

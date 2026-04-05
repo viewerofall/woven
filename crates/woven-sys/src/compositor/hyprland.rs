@@ -100,6 +100,13 @@ impl HyprlandBackend {
         let raw = self.send("j/clients").await?;
         Ok(serde_json::from_str(&raw)?)
     }
+
+    /// j/activeworkspace returns the currently focused workspace
+    async fn fetch_active_workspace_id(&self) -> Result<u32> {
+        let raw = self.send("j/activeworkspace").await?;
+        let v: serde_json::Value = serde_json::from_str(&raw)?;
+        Ok(v["id"].as_u64().unwrap_or(0) as u32)
+    }
 }
 
 #[async_trait]
@@ -111,8 +118,14 @@ impl CompositorBackend for HyprlandBackend {
     }
 
     async fn workspaces(&self) -> Result<Vec<Workspace>> {
-        let clients = self.fetch_clients_raw().await?;
-        let ws_raw  = self.fetch_workspaces_raw().await?;
+        let (clients, ws_raw, active_id) = tokio::join!(
+            self.fetch_clients_raw(),
+            self.fetch_workspaces_raw(),
+            self.fetch_active_workspace_id(),
+        );
+        let clients   = clients?;
+        let ws_raw    = ws_raw?;
+        let active_id = active_id.unwrap_or(0);
 
         let workspaces = ws_raw.as_array()
         .context("Expected array from j/workspaces")?
@@ -121,7 +134,6 @@ impl CompositorBackend for HyprlandBackend {
             let id   = w["id"].as_u64().unwrap_or(0) as u32;
             let name = w["name"].as_str().unwrap_or("").to_string();
 
-            // collect windows belonging to this workspace
             let windows = clients.as_array()
             .map(|arr| {
                 arr.iter()
@@ -131,7 +143,7 @@ impl CompositorBackend for HyprlandBackend {
             })
             .unwrap_or_default();
 
-            Workspace { id, name, active: false, windows }
+            Workspace { id, name, active: id == active_id, windows }
         })
         .collect();
 

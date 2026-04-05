@@ -154,8 +154,8 @@ impl CompositorBackend for NiriBackend {
                 "window_id": id.parse::<u64>().unwrap_or(0),
                               "reference": {"Id": workspace}
             }}}),
-            // Niri doesn't have a pin concept, closest is sticky
-            WmCommand::TogglePin(_) => return Ok(()),
+            WmCommand::TogglePin(id) =>
+            serde_json::json!({"Action": {"ToggleWindowStickingToWorkspace": {"id": id.parse::<u64>().unwrap_or(0)}}}),
             WmCommand::FocusWorkspace(id) =>
             serde_json::json!({"Action": {"FocusWorkspace": {"reference": {"Id": id}}}}),
         };

@@ -77,19 +77,28 @@ woven.bar({
     position = "right",
 })
 
--- ── Hooks (optional) ─────────────────────────────────────────────────────────
--- React to compositor events. Currently informational — use woven.log to debug.
+-- ── Per-app accent colors ─────────────────────────────────────────────────────
+-- Maps window class names to hex accent colors.
+-- Place plugins/ folder next to woven.lua in ~/.config/woven/.
 --
--- Available events:
---   "workspace_focus"  — user switched to a different workspace
---   "window_open"      — a new window appeared
---   "window_close"     — a window was closed
---
--- Example:
--- woven.on("workspace_focus", function(ws)
---     woven.log.info("focused workspace: " .. tostring(ws.id))
+-- require("plugins.app_rules").setup()
+
+-- ── Bar widgets ───────────────────────────────────────────────────────────────
+-- require("plugins.date").setup({ slot = "top",       height = 58, interval = 60 })
+-- require("plugins.nowplaying").setup({ slot = "bottom", height = 62, interval = 5  })
+
+-- ── Event hooks & error handler ───────────────────────────────────────────────
+-- require("plugins.ws_logger").setup()
+
+-- ── Raw hooks (optional) ─────────────────────────────────────────────────────
+-- woven.on("workspace_focus", function(data)
+--     woven.log.info("focused workspace: " .. tostring(data.id))
 -- end)
 --
--- woven.on("window_open", function(win)
---     woven.log.info("opened: " .. win.class .. " — " .. win.title)
+-- woven.on("window_open", function(data)
+--     woven.log.info("opened: " .. data.class .. " — " .. data.title)
+-- end)
+--
+-- woven.on_error(function(msg)
+--     woven.log.error("Config error: " .. msg)
 -- end)

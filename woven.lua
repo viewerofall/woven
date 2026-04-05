@@ -17,14 +17,14 @@
 --   Dracula           background=#282a36  accent=#bd93f9  text=#f8f8f2  border=#6272a4
 
 woven.theme({
-    background    = "#1e1e2e",   -- overlay background
-    border        = "#6c7086",   -- window card borders
-    text          = "#cdd6f4",   -- primary text
-    accent        = "#cba6f7",   -- focused / hover highlight
-    border_radius = 12,          -- card corner radius in pixels
+    background    = "#2e3440",
+    border        = "#4c566a",
+    text          = "#eceff4",
+    accent        = "#88c0d0",
+    border_radius = 10,
     font          = "JetBrainsMono Nerd Font",
     font_size     = 13,
-    opacity       = 0.92,        -- overall overlay alpha
+    opacity       = 0.80,
 })
 
 -- ── Workspaces ────────────────────────────────────────────────────────────────
@@ -43,7 +43,7 @@ woven.workspaces({
 -- overlay_opacity: separate from theme.opacity — controls the grid area only
 
 woven.settings({
-    scroll_dir      = "horizontal",
+    scroll_dir      = "vertical",
     overlay_opacity = 0.92,
 })
 
@@ -60,24 +60,71 @@ woven.settings({
 --   workspace_switch  — active workspace indicator moving
 
 woven.animations({
-    overlay_open  = { curve = "ease_out_cubic",    duration_ms = 180 },
-    overlay_close = { curve = "ease_in_cubic",     duration_ms = 120 },
-    scroll        = { curve = "ease_in_out_cubic", duration_ms = 200 },
+    overlay_open  = { curve = "spring", duration_ms = 180 },
+    overlay_close = { curve = "linear", duration_ms = 180 },
+    scroll        = { curve = "ease_in_out_cubic", duration_ms = 180 },
 })
 
--- ── Hooks (optional) ─────────────────────────────────────────────────────────
--- React to compositor events. Currently informational — use woven.log to debug.
+-- ── Bar ───────────────────────────────────────────────────────────────────────
+-- enabled:  show the persistent workspace bar (true / false)
+-- position: "left" | "right" | "top" | "bottom"
 --
--- Available events:
---   "workspace_focus"  — user switched to a different workspace
---   "window_open"      — a new window appeared
---   "window_close"     — a window was closed
+-- The bar shows workspace screenshots, a toggle button for the overlay,
+-- and a hide button.  Clicking a workspace thumbnail focuses it.
+
+woven.bar({
+    enabled  = false,
+    position = "left",
+})
+
+-- ── AI workspace namer ───────────────────────────────────────────────────
+woven.namer({ enabled = true })
+
+-- ── Per-app accent colors ─────────────────────────────────────────────────────
+-- Maps window class names (lowercase) to hex accent colors.
+-- These override the auto-generated hash colors on workspace cards.
+require("plugins.app_rules").setup({
+    -- your custom overrides go here, e.g.:
+    -- ["myapp"] = "#ff6c6b",
+["kitty"] = "#ff6c6b", 
+})
+
+-- ── Bar widgets (narrow sidebar bar) ─────────────────────────────────────────
+-- Date badge — above workspace cards
+require("plugins.date").setup({ slot = "top", height = 58, interval = 60 })
+
+-- Battery level — uncomment on laptops only
+-- require("plugins.battery").setup({ slot = "top", height = 58, interval = 30 })
+
+-- Now playing — below workspace cards, above sys info
+require("plugins.nowplaying").setup({ slot = "bottom", height = 62, interval = 5 })
+
+-- ── Panel widgets (expanded control center) ───────────────────────────────────
+-- Mini cava spectrum visualizer — appears at bottom of expanded bar
+require("plugins.cava").setup({ slot = "panel", height = 72, interval = 0 })
+
+-- ── Overlay widgets (bottom strip of the overlay) ─────────────────────────────
+-- Greeting message — center zone of overlay bottom strip
+require("plugins.greeting").setup({ slot = "overlay", height = 56, interval = 60 })
+
+-- Live network usage — download + upload rates
+require("plugins.network").setup({ slot = "overlay", height = 56, interval = 2 })
+
+-- Kitty launcher tile
+require("plugins.launcher").setup({ slot = "overlay", height = 56, label = "kitty", cmd = "kitty" })
+
+
+-- ── Event hooks & error handler ───────────────────────────────────────────────
+-- Logs workspace/window events to journalctl and installs a custom error handler.
+require("plugins.ws_logger").setup()
+
+-- ── Raw hooks (optional) ─────────────────────────────────────────────────────
+-- You can also register hooks directly here without a plugin module:
 --
--- Example:
--- woven.on("workspace_focus", function(ws)
---     woven.log.info("focused workspace: " .. tostring(ws.id))
+-- woven.on("workspace_focus", function(data)
+--     woven.log.info("focused workspace: " .. tostring(data.id))
 -- end)
 --
--- woven.on("window_open", function(win)
---     woven.log.info("opened: " .. win.class .. " — " .. win.title)
+-- woven.on("window_open", function(data)
+--     woven.log.info("opened: " .. data.class .. " — " .. data.title)
 -- end)

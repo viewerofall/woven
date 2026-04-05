@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Woven Control Panel
+Comment=Configure and control the woven workspace overlay
+Exec=woven-ctrl
+Terminal=false
+Type=Application
+Categories=Utility;Settings;
+Keywords=woven;wayland;overlay;workspace;
+Icon=woven
+X-GNOME-UsesNotifications=true

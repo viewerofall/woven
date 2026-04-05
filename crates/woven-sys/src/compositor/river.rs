@@ -1,18 +1,16 @@
-//! River compositor backend.
+//! River compositor backend — limited mode.
 //!
 //! River uses a tag-based model instead of numbered workspaces.
-//! Tags 1–32 are bitmasks on each output; woven maps tags 1–9 to
-//! workspaces 1–9, which matches the conventional River keybind setup.
+//! Tags 1–9 map to workspaces 1–9 (the conventional River keybind setup).
 //!
 //! ## Limitations
-//! River's `riverctl` CLI is command-only — it cannot enumerate windows or
-//! query which tags currently have views. This backend:
-//!   - Returns tags 1–9 as workspaces (no live window list)
-//!   - Sends commands via `riverctl` subprocess
-//!   - Falls back to the 2-second poll (no event stream)
+//! River exposes no IPC for window enumeration or active-tag queries.
+//! This backend provides:
+//!   - Tags 1–9 as labeled workspaces (no active-tag detection, no window list)
+//!   - Workspace-switch via `riverctl set-focused-tags`
 //!
-//! Full window enumeration via `wlr-foreign-toplevel-management-v1` is planned
-//! for a future release.
+//! Per-window commands (focus, close, float, pin, move) are not supported
+//! because River has no window-by-id IPC. These are silently ignored.
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -26,25 +24,9 @@ pub struct RiverBackend;
 impl RiverBackend {
     pub fn new() -> Result<Self> { Ok(Self) }
 
-    /// River is running if XDG_CURRENT_DESKTOP=river, or if the `river`
-    /// process is present in /proc (fallback for compositors that don't
-    /// set that variable).
     pub fn detect() -> bool {
-        if std::env::var("XDG_CURRENT_DESKTOP")
+        std::env::var("XDG_CURRENT_DESKTOP")
             .map(|d| d.to_lowercase() == "river")
-            .unwrap_or(false)
-        {
-            return true;
-        }
-        // Fallback: scan /proc/*/comm for a running "river" process.
-        std::fs::read_dir("/proc")
-            .ok()
-            .map(|entries| {
-                entries
-                    .filter_map(|e| e.ok())
-                    .filter_map(|e| std::fs::read_to_string(e.path().join("comm")).ok())
-                    .any(|comm| comm.trim() == "river")
-            })
             .unwrap_or(false)
     }
 
@@ -65,57 +47,31 @@ impl CompositorBackend for RiverBackend {
     // No event stream — rely on the 2-second poll in main.rs.
 
     async fn workspaces(&self) -> Result<Vec<Workspace>> {
-        // River has no workspace concept; tags are the unit of organisation.
-        // Return tags 1–9 as workspaces. Tag 1 is shown as active by default
-        // since we cannot query the current focused-tags bitmask without a
-        // full wlr-status Wayland client.
-        let workspaces = (1u32..=9)
+        // Return tags 1–9 as static workspaces.
+        // River provides no IPC to query which tag is currently focused,
+        // so active is always false (the bar still shows all 9 labels).
+        Ok((1u32..=9)
             .map(|i| Workspace {
                 id:      i,
                 name:    i.to_string(),
-                active:  i == 1,
+                active:  false,
                 windows: Vec::new(),
             })
-            .collect();
-        Ok(workspaces)
+            .collect())
     }
 
     async fn windows(&self) -> Result<Vec<Window>> {
-        // riverctl has no list-views command.
-        // wlr-foreign-toplevel-management-v1 support is planned.
+        // River has no window-enumeration IPC.
         Ok(Vec::new())
     }
 
     async fn dispatch(&self, cmd: WmCommand) -> Result<()> {
-        match cmd {
-            WmCommand::FocusWorkspace(id) => {
-                // River tags are a bitmask: workspace N → bit (N-1).
-                let mask = 1u32 << id.saturating_sub(1);
-                Self::riverctl(&["set-focused-tags", &mask.to_string()]).await?;
-            }
-            WmCommand::FocusWindow(_) => {
-                // River has no focus-by-id; focus is seat/position-based.
-            }
-            WmCommand::CloseWindow(_) => {
-                // Closes the currently focused view — best we can do.
-                Self::riverctl(&["close"]).await?;
-            }
-            WmCommand::FullscreenWindow(_) => {
-                Self::riverctl(&["toggle-fullscreen"]).await?;
-            }
-            WmCommand::ToggleFloat(_) => {
-                Self::riverctl(&["toggle-float"]).await?;
-            }
-            WmCommand::TogglePin(_) => {
-                // River has no sticky/pin concept.
-            }
-            WmCommand::MoveWindow { workspace: ws, .. } |
-            WmCommand::MoveToWorkspace { ws, .. } => {
-                // Move the focused view to a tag.
-                let mask = 1u32 << ws.saturating_sub(1);
-                Self::riverctl(&["set-view-tags", &mask.to_string()]).await?;
-            }
+        if let WmCommand::FocusWorkspace(id) = cmd {
+            // Tags are a bitmask: workspace N → bit (N-1).
+            let mask = 1u32 << id.saturating_sub(1);
+            Self::riverctl(&["set-focused-tags", &mask.to_string()]).await?;
         }
+        // All per-window commands are unsupported on River.
         Ok(())
     }
 }

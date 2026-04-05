@@ -305,7 +305,7 @@ impl SeatHandler for BarState {
     fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
 
-    fn new_capability(&mut self, conn: &Connection, qh: &QueueHandle<Self>,
+    fn new_capability(&mut self, _conn: &Connection, qh: &QueueHandle<Self>,
                       seat: wl_seat::WlSeat, cap: Capability) {
         if cap == Capability::Pointer && self.pointer.is_none() {
             let cs = self.compositor.create_surface(qh);

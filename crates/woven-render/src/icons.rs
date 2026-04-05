@@ -25,21 +25,66 @@ pub struct IconCache {
     desktop_map: HashMap<String, String>,
     desktop_scanned: bool,
     icon_size: u32,
+    /// Plugin-registered overrides: class (lowercase) → absolute file path.
+    /// Checked before the XDG scan — highest priority.
+    overrides: HashMap<String, String>,
+    /// Optional default icon path for classes not in `overrides` or XDG.
+    override_default: Option<String>,
+    /// Decoded cache for override paths (keyed by file path, not class).
+    override_cache: HashMap<String, Option<IconData>>,
+}
+
+impl Default for IconCache {
+    fn default() -> Self {
+        Self {
+            cache:            HashMap::new(),
+            file_cache:       HashMap::new(),
+            desktop_map:      HashMap::new(),
+            desktop_scanned:  false,
+            icon_size:        48,
+            overrides:        HashMap::new(),
+            override_default: None,
+            override_cache:   HashMap::new(),
+        }
+    }
 }
 
 impl IconCache {
     pub fn new() -> Self {
-        Self {
-            cache:           HashMap::new(),
-            file_cache:      HashMap::new(),
-            desktop_map:     HashMap::new(),
-            desktop_scanned: false,
-            icon_size:       48,
+        Self::default()
+    }
+
+    /// Register a plugin icon override.  `class` is matched case-insensitively.
+    /// `path` may be absolute or relative to the process working directory.
+    pub fn register_override(&mut self, class: String, path: String) {
+        // Invalidate any cached result for this class so it re-resolves.
+        self.cache.remove(&class.to_lowercase());
+        self.overrides.insert(class.to_lowercase(), path);
+    }
+
+    /// Register a fallback icon used when no class-specific override matches
+    /// and the XDG scan also finds nothing.
+    pub fn register_override_default(&mut self, path: String) {
+        self.override_default = Some(path);
+        // Clear all confirmed misses so they get a second chance with the new default.
+        self.cache.retain(|_, v| v.is_some());
+    }
+
+    fn load_override(&mut self, path: &str) -> Option<IconData> {
+        if let Some(cached) = self.override_cache.get(path) {
+            return cached.clone();
         }
+        let result = load_png_rgba(std::path::Path::new(path))
+            .map(|(w, h, px)| scale_rgba(w, h, &px, self.icon_size, self.icon_size));
+        self.override_cache.insert(path.to_string(), result.clone());
+        result
     }
 
     /// Return RGBA bytes for the best available icon for `app_id`, or `None`.
-    /// Lazily scans .desktop files and loads PNG on first call per app_id.
+    /// Resolution order:
+    ///   1. Plugin override for this specific class
+    ///   2. XDG .desktop + hicolor + pixmaps
+    ///   3. Plugin override default (if set)
     pub fn get(&mut self, app_id: &str) -> Option<&IconData> {
         let key = app_id.to_lowercase();
 
@@ -48,21 +93,27 @@ impl IconCache {
             return self.cache.get(&key).and_then(|v| v.as_ref());
         }
 
-        // Ensure desktop files have been scanned.
+        // 1. Plugin override — highest priority.
+        if let Some(path) = self.overrides.get(&key).cloned() {
+            let data = self.load_override(&path);
+            self.cache.insert(key.clone(), data);
+            return self.cache.get(&key).and_then(|v| v.as_ref());
+        }
+
+        // 2. XDG scan.
         if !self.desktop_scanned {
             self.desktop_map = scan_desktop_files();
             self.desktop_scanned = true;
             debug!("icons: scanned {} desktop entries", self.desktop_map.len());
         }
-
-        // Resolve icon name from the app_id using several strategies.
         let icon_name = self.resolve_icon_name(&key);
+        let data = if let Some(ref name) = icon_name { self.load_icon(name) } else { None };
 
-        let data = if let Some(ref name) = icon_name {
-            self.load_icon(name)
-        } else {
-            None
-        };
+        // 3. Fall through to plugin default if XDG found nothing.
+        let data = data.or_else(|| {
+            self.override_default.clone()
+                .and_then(|p| self.load_override(&p))
+        });
 
         self.cache.insert(key.clone(), data);
         self.cache.get(&key).and_then(|v| v.as_ref())
@@ -168,7 +219,7 @@ fn parse_desktop_file(path: &Path, map: &mut HashMap<String, String>) {
             "Exec" => {
                 // Strip path and flags to get the bare executable name
                 if let Some(exe) = v.split_whitespace().next() {
-                    let base = exe.split('/').last().unwrap_or(exe);
+                    let base = exe.rsplit('/').next().unwrap_or(exe);
                     // Strip common wrappers (env, flatpak run, etc.)
                     let base = base.trim_end_matches(".sh");
                     keys.push(base.to_lowercase());
@@ -183,7 +234,7 @@ fn parse_desktop_file(path: &Path, map: &mut HashMap<String, String>) {
         keys.push(stem.to_lowercase());
         // And short form
         if stem.contains('.') {
-            if let Some(last) = stem.split('.').last() {
+            if let Some(last) = stem.rsplit('.').next() {
                 keys.push(last.to_lowercase());
             }
         }

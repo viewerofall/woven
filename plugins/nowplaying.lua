@@ -8,8 +8,16 @@ local MAX = 5
 
 local function trunc(s, n)
     if not s or s == "" then return "" end
-    if #s <= n then return s end
-    return s:sub(1, n - 1) .. "."
+    -- utf8.len returns nil for invalid sequences; fall back to byte length
+    local len = utf8.len(s) or #s
+    if len <= n then return s end
+    -- Walk n-1 codepoints to find the safe byte offset
+    local i = 0
+    for _ = 1, n - 1 do
+        i = utf8.offset(s, 2, i) or (#s + 1)
+        if i > #s then break end
+    end
+    return s:sub(1, i - 1) .. "."
 end
 
 function M.setup(opts)

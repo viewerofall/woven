@@ -2,6 +2,7 @@
 //! XWayland windows appear in Hyprland's client list tagged xwayland=true
 //! but their PIDs need resolving via _NET_WM_PID on the X11 side.
 //! After PID resolution they flow through the normal window pipeline.
+#![allow(dead_code)]
 
 use anyhow::Result;
 use tracing::debug;

@@ -3,10 +3,10 @@
 //! Protocol flow per frame:
 //!   1. `zwlr_screencopy_manager_v1.capture_output_region(output, x, y, w, h)`
 //!      → `ZwlrScreencopyFrameV1` proxy (returned, stored in `live_frames` to
-//!         keep the Wayland object alive)
+//!      keep the Wayland object alive)
 //!   2. Compositor fires `buffer(Xrgb8888, w, h, stride)` event
 //!      → We allocate a `ShmAlloc`, create `wl_shm_pool` + `wl_buffer`,
-//!        call `frame.copy(buffer)` — all inside the Dispatch handler.
+//!      call `frame.copy(buffer)` — all inside the Dispatch handler.
 //!   3. Compositor fires `ready` → pixels are in the mmap; we send
 //!      `ThumbnailFrame` on the channel and clean up.
 //!   4. Compositor fires `failed` → log and clean up silently.
@@ -145,7 +145,7 @@ impl Dispatch<WlRegistry, ()> for ScreencopyState {
       }
       "wl_output" => {
         // v2 adds the `scale` event we need for HiDPI coordinate mapping.
-        state.outputs.push(registry.bind(name, version.min(4).max(2), qh, ()));
+        state.outputs.push(registry.bind(name, version.clamp(2, 4), qh, ()));
       }
       _ => {}
     }

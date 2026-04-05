@@ -1,0 +1,12 @@
+[package]
+name    = "woven-plugin"
+version = "0.1.0"
+edition = "2021"
+description = "woven plugin host — manifest types, registry, and loader"
+
+[dependencies]
+woven-common = { path = "../woven-common" }
+
+serde      = { workspace = true }
+serde_json = { workspace = true }
+tracing    = { workspace = true }

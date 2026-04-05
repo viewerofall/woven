@@ -39,26 +39,47 @@ pub fn write_config(content: &str) -> Result<(), String> {
 
 // ── Lua parsers ───────────────────────────────────────────────────────────────
 
+/// Find `key = "value"` on any line, tolerating any amount of alignment whitespace.
 pub fn lua_str(src: &str, key: &str) -> Option<String> {
-    let needle = format!("{} = \"", key);
-    let start  = src.find(&needle)? + needle.len();
-    let end    = start + src[start..].find('"')?;
-    Some(src[start..end].to_string())
+    for line in src.lines() {
+        let t = line.trim_start();
+        if !t.starts_with(key) { continue; }
+        let after = &t[key.len()..];
+        // Key must be followed by whitespace or '=' — not just a prefix of a longer key
+        if !after.starts_with([' ', '\t', '=']) { continue; }
+        let after = after.trim_start_matches([' ', '\t']);
+        let after = after.strip_prefix('=')?;
+        let after = after.trim_start_matches([' ', '\t']);
+        let after = after.strip_prefix('"')?;
+        let end   = after.find('"')?;
+        return Some(after[..end].to_string());
+    }
+    None
 }
 
+/// Find `key = value` (unquoted number/bool) on any line, tolerating alignment whitespace.
 pub fn lua_num(src: &str, key: &str) -> Option<String> {
-    let needle = format!("{} = ", key);
-    let start  = src.find(&needle)? + needle.len();
-    let end    = start + src[start..].find(|c: char| c == ',' || c == '\n' || c == '}')?;
-    let val = src[start..end].trim().to_string();
-    if val.is_empty() { None } else { Some(val) }
+    for line in src.lines() {
+        let t = line.trim_start();
+        if !t.starts_with(key) { continue; }
+        let after = &t[key.len()..];
+        if !after.starts_with([' ', '\t', '=']) { continue; }
+        let after = after.trim_start_matches([' ', '\t']);
+        let after = after.strip_prefix('=')?;
+        let after = after.trim_start_matches([' ', '\t']);
+        let end   = after.find([',', '\n', '}', ' ', '\t'])
+                         .unwrap_or(after.len());
+        let v = after[..end].trim();
+        if v.is_empty() { return None; }
+        return Some(v.to_string());
+    }
+    None
 }
 
+/// Find `key = true/false` on any line, tolerating alignment whitespace.
 pub fn lua_bool(src: &str, key: &str) -> Option<bool> {
-    let needle = format!("{} = ", key);
-    let start  = src.find(&needle)? + needle.len();
-    let end    = start + src[start..].find(|c: char| c == ',' || c == '\n' || c == '}')?;
-    match src[start..end].trim() {
+    let val = lua_num(src, key)?;
+    match val.as_str() {
         "true"  => Some(true),
         "false" => Some(false),
         _       => None,
@@ -310,4 +331,91 @@ fn splice_block(config: &str, marker: &str, block: &str) -> String {
         }
     }
     format!("{}\n{}\n", config.trim_end(), block)
+}
+
+// ── Plugin setup helpers ─────────────────────────────────────────────────
+
+/// Extract the text between `{` and the matching `}` in a plugin's `setup({...})` call.
+/// Handles nested braces (e.g. colors arrays, sub-tables).
+pub fn extract_plugin_opts(config: &str, plugin: &str) -> String {
+    for q in ['"', '\''] {
+        let marker = format!("require({0}plugins.{1}{0}).setup({{", q, plugin);
+        if let Some(pos) = config.find(&marker) {
+            let content_start = pos + marker.len();
+            let rest = &config[content_start..];
+            let mut depth = 1u32;
+            for (i, ch) in rest.char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return rest[..i].to_string();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+/// Replace a plugin's entire `require("plugins.X").setup(...)` call with `block`.
+/// Handles both single-line and multi-line setup calls with nested braces.
+pub fn splice_plugin_setup(config: &str, plugin: &str, block: &str) -> String {
+    for q in ['"', '\''] {
+        let marker = format!("require({0}plugins.{1}{0}).setup(", q, plugin);
+        if let Some(start) = config.find(&marker) {
+            let after_paren = &config[start + marker.len()..];
+
+            // setup() with no args
+            if after_paren.starts_with(')') {
+                let end = start + marker.len() + 1;
+                return format!("{}{}{}", &config[..start], block, &config[end..]);
+            }
+
+            // setup({...}) — match braces to find the end
+            if after_paren.starts_with('{') {
+                let mut depth = 0u32;
+                for (i, ch) in after_paren.char_indices() {
+                    match ch {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                let mut end = start + marker.len() + i + 1;
+                                if config.get(end..end + 1) == Some(")") {
+                                    end += 1;
+                                }
+                                return format!("{}{}{}", &config[..start], block, &config[end..]);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    format!("{}\n{}\n", config.trim_end(), block)
+}
+
+/// Parse `["key"] = "value"` pairs from a Lua table snippet.
+pub fn parse_lua_bracket_table(src: &str) -> Vec<(String, String)> {
+    let mut results = Vec::new();
+    for line in src.lines() {
+        let t = line.trim();
+        if !t.starts_with("[\"") { continue; }
+        if let Some(k_end) = t[2..].find("\"]") {
+            let key = t[2..2 + k_end].to_string();
+            let rest = &t[2 + k_end + 2..];
+            let rest = rest.trim_start().trim_start_matches('=').trim_start();
+            if let Some(stripped) = rest.strip_prefix('"') {
+                if let Some(v_end) = stripped.find('"') {
+                    results.push((key, stripped[..v_end].to_string()));
+                }
+            }
+        }
+    }
+    results
 }

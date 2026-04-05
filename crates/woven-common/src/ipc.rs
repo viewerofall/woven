@@ -28,7 +28,7 @@ pub enum IpcCommand {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum IpcResponse {
     Ok,
-    Status(DaemonStatus),
+    Status(Box<DaemonStatus>),
     Error(String),
 }
 

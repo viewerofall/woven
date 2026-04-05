@@ -41,6 +41,10 @@ pub struct TextRenderer {
     layout_cache:   HashMap<MeasureKey, LayoutEntry>,
 }
 
+impl Default for TextRenderer {
+    fn default() -> Self { Self::new() }
+}
+
 impl TextRenderer {
     pub fn new() -> Self {
         let text_data = load_font(&[
@@ -208,7 +212,7 @@ Install ttf-jetbrains-mono-nerd (CachyOS: sudo pacman -S ttf-jetbrains-mono-nerd
             self.layout.reset(&Default::default());
             self.layout.append(
                 &self.fonts.iter().collect::<Vec<_>>(),
-                               &TextStyle::new(&run_text, size, fi),
+                               &TextStyle::new(run_text, size, fi),
             );
             let w = self.layout.glyphs().iter()
             .map(|g| g.x + g.width as f32)

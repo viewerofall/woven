@@ -10,7 +10,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::thread;
 use tracing::{error, info, warn};
-use woven_common::types::{AnimationConfig, BarConfig, BarPosition, EasingCurve, Theme, Workspace, WorkspaceMetrics};
+use woven_common::types::{AnimationConfig, BarConfig, BarPosition, DrawCmd, EasingCurve, LayoutConfig, Theme, WidgetDef, Workspace, WorkspaceMetrics};
 
 use crate::bar_surface::{BarSurface, BAR_THICK, PANEL_THICK};
 use crate::draw::Painter;
@@ -30,6 +30,19 @@ pub enum RenderCmd {
     CaptureForWorkspace(u32),
     /// Apply new bar configuration (creates or destroys the bar surface).
     UpdateBarConfig(BarConfig),
+    /// Apply new layout dimensions from `woven.layout({})`.
+    UpdateLayout(LayoutConfig),
+    /// Register plugin icon overrides — class (lowercase) → absolute PNG path.
+    /// `default_icon` is used when no class match is found by any source.
+    UpdateIconOverrides { map: std::collections::HashMap<String, String>, default_icon: Option<String> },
+    /// Apply per-app accent color rules from `woven.rules({})`.
+    UpdateAppRules(std::collections::HashMap<String, String>),
+    /// Register a new bar widget (idempotent — re-registration replaces old def).
+    RegisterWidget(WidgetDef),
+    /// Push fresh draw-command content for a registered widget.
+    UpdateWidgetContent { id: String, cmds: Vec<DrawCmd> },
+    /// Show an error toast notification on the overlay.
+    ShowToast { message: String, duration_ms: u32 },
     Shutdown,
 }
 
@@ -188,7 +201,24 @@ fn render_loop(
                         bar_surface = None;
                     }
                 }
-                RenderCmd::UpdateTheme(t) => painter.update_theme(t),
+                RenderCmd::UpdateTheme(t)  => painter.update_theme(t),
+                RenderCmd::UpdateLayout(l) => painter.update_layout(l),
+                RenderCmd::UpdateIconOverrides { map, default_icon } => {
+                    painter.update_icon_overrides(map, default_icon);
+                }
+                RenderCmd::UpdateAppRules(rules) => painter.update_app_rules(rules),
+                RenderCmd::ShowToast { message, duration_ms } => {
+                    painter.show_toast(message, duration_ms);
+                    // Ensure overlay is visible so the toast can be seen.
+                    if !visible {
+                        visible = true;
+                        visible_flag.store(true, Ordering::Relaxed);
+                        surface.show()?;
+                        anim_from = anim_t; anim_target = 1.0; anim_start = std::time::Instant::now();
+                    }
+                }
+                RenderCmd::RegisterWidget(def) => painter.register_widget(def),
+                RenderCmd::UpdateWidgetContent { id, cmds } => painter.update_widget_content(id, cmds),
                 RenderCmd::UpdateSettings { show_empty } => painter.update_settings(show_empty),
                 RenderCmd::UpdateState { workspaces, metrics } => {
                     painter.update_state(workspaces, metrics);
@@ -295,7 +325,9 @@ fn render_loop(
                     if dy > 0.5 { painter.next_page(); }
                     else if dy < -0.5 { painter.prev_page(); }
                 }
-                MouseEvent::Key { .. } => { if visible { pending_hide = true; } }
+                MouseEvent::Key { keysym } => {
+                    if visible && painter.on_key(keysym) { pending_hide = true; }
+                }
             }
         }
 
@@ -343,6 +375,7 @@ fn render_loop(
                 anim_t = 0.0;
                 visible = false;
                 visible_flag.store(false, Ordering::Relaxed);
+                painter.reset_kb();
                 surface.hide()?; // keyboard=None, buffer stays attached (transparent)
             }
         }
@@ -368,6 +401,7 @@ fn render_loop(
                 }
             }
         }
+
 
         // ── draw + present ────────────────────────────────────────────────────
         // Always render while visible OR animating (close anim needs to play out).

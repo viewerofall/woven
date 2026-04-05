@@ -34,7 +34,6 @@ pub struct Setup {
     col_text:    String,
     col_border:  String,
     keybind:     String,
-    status:      String,
 }
 
 impl Default for Setup {
@@ -60,7 +59,6 @@ impl Default for Setup {
             col_text:   txt.to_string(),
             col_border: bd.to_string(),
             keybind:    "Super+grave".into(),
-            status:     String::new(),
         }
     }
 }

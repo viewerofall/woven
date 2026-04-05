@@ -58,9 +58,12 @@ local ok, err = pcall(function()
 end)
 
 if not ok then
-    log.error("Config error: " .. tostring(err))
+    local msg = tostring(err)
+    log.error("Config error: " .. msg)
     log.warn("Continuing with built-in defaults.")
-    -- don't block startup on a bad config
+    -- Fire error handler / show overlay toast after core starts
+    -- (delayed so woven.__fire_error can show the overlay)
+    woven.__fire_error(msg)
 end
 
 -- ── Start core and replay buffered config ─────────────────────────────────────

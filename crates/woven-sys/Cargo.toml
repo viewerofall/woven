@@ -31,3 +31,5 @@ wayland-protocols-wlr  = { workspace = true }
 
 crossbeam-channel = { workspace = true }
 xcb               = { workspace = true }
+chrono            = { workspace = true }
+ureq              = { workspace = true }

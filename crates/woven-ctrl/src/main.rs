@@ -5,7 +5,9 @@
 
 mod setup;
 mod helpers;
+mod compositor_config;
 use helpers::*;
+use compositor_config::{CompositorStatus, detect_all, inject_keybind, inject_autostart, reload_compositor};
 use woven_common::ipc::{IpcCommand, IpcResponse};
 
 use iced::{
@@ -19,7 +21,7 @@ use iced::{
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Default)]
-enum Tab { #[default] Status, Bar, Theme, Overview, Config }
+enum Tab { #[default] Status, Bar, Theme, Overview, Plugins, Config }
 
 // ── Messages ──────────────────────────────────────────────────────────────────
 
@@ -27,13 +29,15 @@ enum Tab { #[default] Status, Bar, Theme, Overview, Config }
 enum ColorField { Background, Accent, Text, Border }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 enum Msg {
     TabSelect(Tab),
-    Noop,
 
     // Status tab
     DaemonPoll(String, String, bool),
     DaemonShow, DaemonHide, DaemonToggle, DaemonReload,
+    InjectKeybind(String),
+    InjectAutostart(String),
 
     // Bar tab
     BarEnabledToggle(bool),
@@ -59,11 +63,45 @@ enum Msg {
     AnimScrollMsChanged(String),
     OverviewApply,
 
+    // Plugins tab
+    PluginsFetch,
+    PluginsFetched(Vec<PluginRemote>),
+    PluginInstall(String),
+    PluginInstalled(String, Result<(), String>),
+    PluginRemove(String),
+    PluginEnable(String),
+    PluginDisable(String),
+    PluginSettings(String),
+    PluginSettingsClose,
+    PluginSettingUpdate { plugin: String, key: String, value: String },
+    PluginSettingsSave,
+    AppRuleAdd,
+    AppRuleRemove(String),
+    AppRuleNewClassChanged(String),
+    AppRuleNewColorChanged(String),
+
     // Config tab
     ConfigAction(text_editor::Action),
     ConfigSave,
     ConfigReset,
     ConfigReload,
+}
+
+/// A plugin available on the remote repository.
+#[derive(Debug, Clone)]
+struct PluginRemote {
+    name: String,          // e.g. "clock"
+    filename: String,      // e.g. "clock.lua"
+    download_url: String,  // raw GitHub URL
+}
+
+/// Local view of a plugin: combines remote info with local state.
+#[derive(Debug, Clone)]
+struct PluginView {
+    name: String,
+    download_url: Option<String>,
+    installed: bool,
+    enabled: bool,
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -76,6 +114,8 @@ struct App {
     daemon_on:       bool,
     daemon_vis:      bool,
     status:          String,
+    // compositor keybind detection
+    comp_statuses:   Vec<CompositorStatus>,
     // bar
     bar_enabled:     bool,
     bar_position:    String,
@@ -96,6 +136,14 @@ struct App {
     anim_close_ms:     String,
     anim_scroll_curve: String,
     anim_scroll_ms:    String,
+    // plugins
+    plugins_remote:  Vec<PluginRemote>,
+    plugins_status:  String,
+    plugins_loading: bool,
+    plugin_settings_open: Option<String>,
+    plugin_settings_data: std::collections::HashMap<String, String>,
+    app_rules_new_class: String,
+    app_rules_new_color: String,
     // config editor
     config_content:  text_editor::Content,
     config_dirty:    bool,
@@ -113,6 +161,7 @@ impl Default for App {
             daemon_on:       false,
             daemon_vis:      false,
             status:          String::new(),
+            comp_statuses:   detect_all(),
             bar_enabled:     bar.enabled,
             bar_position:    bar.position,
             preset:          theme.preset,
@@ -130,6 +179,13 @@ impl Default for App {
             anim_close_ms:     overview.anim_close_ms,
             anim_scroll_curve: overview.anim_scroll_curve,
             anim_scroll_ms:    overview.anim_scroll_ms,
+            plugins_remote:  Vec::new(),
+            plugins_status:  String::new(),
+            plugins_loading: false,
+            plugin_settings_open: None,
+            plugin_settings_data: std::collections::HashMap::new(),
+            app_rules_new_class: String::new(),
+            app_rules_new_color: String::new(),
             config_content:  text_editor::Content::with_text(&read_config()),
             config_dirty:    false,
         }
@@ -162,10 +218,12 @@ fn update(s: &mut App, msg: Msg) -> Task<Msg> {
             if t == Tab::Config && !s.config_dirty {
                 s.config_content = text_editor::Content::with_text(&read_config());
             }
+            let auto_fetch = t == Tab::Plugins && s.plugins_remote.is_empty() && !s.plugins_loading;
             s.tab = t;
+            if auto_fetch {
+                return update(s, Msg::PluginsFetch);
+            }
         }
-        Msg::Noop => {}
-
         // ── Status ────────────────────────────────────────────────────────────
         Msg::DaemonPoll(comp, ver, vis) => {
             s.daemon_on  = comp != "offline";
@@ -177,6 +235,30 @@ fn update(s: &mut App, msg: Msg) -> Task<Msg> {
         Msg::DaemonHide   => { send_ipc(IpcCommand::Hide);         s.daemon_vis = false; s.status = "Overlay hidden.".into(); }
         Msg::DaemonToggle => { send_ipc(IpcCommand::Toggle);       s.status = "Toggled.".into(); }
         Msg::DaemonReload => { send_ipc(IpcCommand::ReloadConfig); s.status = "Config reloaded.".into(); }
+        Msg::InjectKeybind(name) => {
+            if let Some(cs) = s.comp_statuses.iter().find(|c| c.name == name).cloned() {
+                match inject_keybind(&cs) {
+                    Ok(()) => {
+                        reload_compositor(&cs);
+                        s.status = format!("Keybind added to {} config.", name);
+                    }
+                    Err(e) => s.status = format!("Inject failed: {e}"),
+                }
+                s.comp_statuses = detect_all(); // refresh status
+            }
+        }
+        Msg::InjectAutostart(name) => {
+            if let Some(cs) = s.comp_statuses.iter().find(|c| c.name == name).cloned() {
+                match inject_autostart(&cs) {
+                    Ok(()) => {
+                        reload_compositor(&cs);
+                        s.status = format!("Autostart added to {} config.", name);
+                    }
+                    Err(e) => s.status = format!("Inject failed: {e}"),
+                }
+                s.comp_statuses = detect_all(); // refresh status
+            }
+        }
 
         // ── Bar ───────────────────────────────────────────────────────────────
         Msg::BarEnabledToggle(v) => s.bar_enabled  = v,
@@ -269,6 +351,128 @@ fn update(s: &mut App, msg: Msg) -> Task<Msg> {
             }
         }
 
+        // ── Plugins ───────────────────────────────────────────────────────────
+        Msg::PluginsFetch => {
+            s.plugins_loading = true;
+            s.plugins_status = "Fetching plugin list...".into();
+            return Task::perform(
+                async {
+                    tokio::task::spawn_blocking(fetch_plugin_list)
+                        .await
+                        .unwrap_or_default()
+                },
+                Msg::PluginsFetched,
+            );
+        }
+        Msg::PluginsFetched(list) => {
+            s.plugins_loading = false;
+            if list.is_empty() {
+                s.plugins_status = "Failed to fetch plugin list from GitHub.".into();
+            } else {
+                s.plugins_status = format!("Found {} plugins.", list.len());
+            }
+            s.plugins_remote = list;
+        }
+        Msg::PluginInstall(name) => {
+            if let Some(p) = s.plugins_remote.iter().find(|p| p.name == name) {
+                let url = p.download_url.clone();
+                let filename = p.filename.clone();
+                let name_c = name.clone();
+                s.plugins_status = format!("Installing {}...", name);
+                return Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || install_plugin(&name_c, &filename, &url))
+                            .await
+                            .unwrap_or(Err("spawn failed".into()))
+                    },
+                    move |r| Msg::PluginInstalled(name, r),
+                );
+            }
+        }
+        Msg::PluginInstalled(name, result) => match result {
+            Ok(()) => s.plugins_status = format!("{} installed.", name),
+            Err(e) => s.plugins_status = format!("Install failed: {}", e),
+        },
+        Msg::PluginRemove(name) => {
+            let path = plugins_dir().join(format!("{}.lua", name));
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    // Also disable if enabled
+                    disable_plugin_in_config(&name);
+                    s.plugins_status = format!("{} removed.", name);
+                }
+                Err(e) => s.plugins_status = format!("Remove failed: {}", e),
+            }
+        }
+        Msg::PluginEnable(name) => {
+            enable_plugin_in_config(&name);
+            send_ipc(IpcCommand::ReloadConfig);
+            s.plugins_status = format!("{} enabled and config reloaded.", name);
+        }
+        Msg::PluginDisable(name) => {
+            disable_plugin_in_config(&name);
+            send_ipc(IpcCommand::ReloadConfig);
+            s.plugins_status = format!("{} disabled and config reloaded.", name);
+        }
+        Msg::PluginSettings(name) => {
+            // Load current settings for this plugin from config
+            s.plugin_settings_data = load_plugin_settings(&name);
+            s.plugin_settings_open = Some(name);
+        }
+        Msg::PluginSettingsClose => {
+            s.plugin_settings_open = None;
+            s.plugin_settings_data.clear();
+        }
+        Msg::PluginSettingUpdate { key, value, .. } => {
+            s.plugin_settings_data.insert(key, value);
+        }
+        Msg::PluginSettingsSave => {
+            if let Some(plugin) = &s.plugin_settings_open.clone() {
+                if apply_plugin_settings(plugin, &s.plugin_settings_data) {
+                    s.config_content = text_editor::Content::with_text(&read_config());
+                    s.config_dirty = false;
+                    send_ipc(IpcCommand::ReloadConfig);
+                    s.plugins_status = format!("{} settings saved.", plugin);
+                    s.plugin_settings_open = None;
+                    s.plugin_settings_data.clear();
+                } else {
+                    s.plugins_status = "Failed to save plugin settings.".into();
+                }
+            }
+        }
+        Msg::AppRuleAdd => {
+            let class = s.app_rules_new_class.trim().to_lowercase();
+            let color = s.app_rules_new_color.trim().to_string();
+            if !class.is_empty() && color.starts_with('#') && color.len() >= 4 {
+                let count: usize = s.plugin_settings_data.get("rule_count")
+                    .and_then(|v| v.parse().ok()).unwrap_or(0);
+                s.plugin_settings_data.insert(format!("rule_{}_class", count), class);
+                s.plugin_settings_data.insert(format!("rule_{}_color", count), color);
+                s.plugin_settings_data.insert("rule_count".into(), (count + 1).to_string());
+                s.app_rules_new_class.clear();
+                s.app_rules_new_color.clear();
+            }
+        }
+        Msg::AppRuleRemove(idx_str) => {
+            if let Ok(idx) = idx_str.parse::<usize>() {
+                let count: usize = s.plugin_settings_data.get("rule_count")
+                    .and_then(|v| v.parse().ok()).unwrap_or(0);
+                if idx < count {
+                    for i in idx..count - 1 {
+                        let nc = s.plugin_settings_data.get(&format!("rule_{}_class", i + 1)).cloned().unwrap_or_default();
+                        let nv = s.plugin_settings_data.get(&format!("rule_{}_color", i + 1)).cloned().unwrap_or_default();
+                        s.plugin_settings_data.insert(format!("rule_{}_class", i), nc);
+                        s.plugin_settings_data.insert(format!("rule_{}_color", i), nv);
+                    }
+                    s.plugin_settings_data.remove(&format!("rule_{}_class", count - 1));
+                    s.plugin_settings_data.remove(&format!("rule_{}_color", count - 1));
+                    s.plugin_settings_data.insert("rule_count".into(), (count - 1).to_string());
+                }
+            }
+        }
+        Msg::AppRuleNewClassChanged(v) => s.app_rules_new_class = v,
+        Msg::AppRuleNewColorChanged(v) => s.app_rules_new_color = v,
+
         // ── Config ────────────────────────────────────────────────────────────
         Msg::ConfigAction(a) => { s.config_content.perform(a); s.config_dirty = true; }
         Msg::ConfigReload => {
@@ -303,6 +507,7 @@ fn view(s: &App) -> Element<'_, Msg> {
         tab_btn("Bar",      Tab::Bar,      &s.tab),
         tab_btn("Theme",    Tab::Theme,    &s.tab),
         tab_btn("Overview", Tab::Overview, &s.tab),
+        tab_btn("Plugins",  Tab::Plugins,  &s.tab),
         tab_btn("Config",   Tab::Config,   &s.tab),
     ].spacing(4).padding([8u16, 12u16]);
 
@@ -311,6 +516,7 @@ fn view(s: &App) -> Element<'_, Msg> {
         Tab::Bar      => view_bar(s),
         Tab::Theme    => view_theme(s),
         Tab::Overview => view_overview(s),
+        Tab::Plugins  => view_plugins(s),
         Tab::Config   => view_config(s),
     };
 
@@ -323,7 +529,18 @@ fn view(s: &App) -> Element<'_, Msg> {
         ].align_y(Alignment::Center).spacing(8),
     ).padding([5u16, 14u16]).width(Length::Fill);
 
-    column![tab_bar, rule::horizontal(1), body, rule::horizontal(1), status_bar].into()
+    let main_ui: Element<Msg> = column![tab_bar, rule::horizontal(1), body, rule::horizontal(1), status_bar].into();
+
+    // Overlay plugin settings modal if open
+    if let Some(plugin_name) = &s.plugin_settings_open {
+        use iced::widget::stack;
+        stack![
+            main_ui,
+            view_plugin_settings_modal(s, plugin_name),
+        ].into()
+    } else {
+        main_ui
+    }
 }
 
 // ── Status tab ────────────────────────────────────────────────────────────────
@@ -345,7 +562,7 @@ fn view_status(s: &App) -> Element<'_, Msg> {
         text("Run `woven` in a terminal or add it to your compositor autostart.").size(12).into()
     };
 
-    scrollable(column![
+    let mut col = column![
         text("woven daemon").size(22),
         row![
             text(if s.daemon_on { "●" } else { "○" }).size(18).color(online_color),
@@ -370,20 +587,75 @@ fn view_status(s: &App) -> Element<'_, Msg> {
         cli_ref("woven-ctrl --reload", "Reload woven.lua without restart"),
 
         rule::horizontal(1),
-        text("Compositor keybinds").size(16),
-        text("Hyprland:").size(12),
-        mono("  bind = SUPER, grave, exec, woven-ctrl --toggle"),
-        mono("  exec-once = woven"),
-        text("Niri:").size(12),
-        mono("  spawn-at-startup \"woven\""),
-        mono("  Super+Grave { spawn \"woven-ctrl\" \"--toggle\"; }"),
-        text("Sway:").size(12),
-        mono("  exec woven"),
-        mono("  bindsym Super+grave exec woven-ctrl --toggle"),
-        text("River:").size(12),
-        mono("  riverctl spawn woven"),
-        mono("  riverctl map normal Super grave spawn 'woven-ctrl --toggle'"),
-    ].spacing(14).padding([32u16, 32u16])).into()
+        text("Compositor setup").size(16),
+        text("Detected compositors on this system:").size(12),
+    ].spacing(14).padding([32u16, 32u16]);
+
+    // Compositor rows — one per installed compositor
+    let green  = Color::from_rgb(0.63, 0.85, 0.63);
+    let yellow = Color::from_rgb(0.95, 0.85, 0.45);
+    let dim    = Color::from_rgb(0.55, 0.55, 0.55);
+
+    for cs in &s.comp_statuses {
+        if !cs.installed { continue; }
+
+        let running_tag = if cs.is_running { " (running now)" } else { "" };
+        col = col.push(
+            column![
+                text(format!("{}{}", cs.name, running_tag)).size(14),
+                text(format!("config: {}", cs.config_path)).size(10).color(dim),
+            ].spacing(2)
+        );
+
+        if !cs.config_exists {
+            col = col.push(
+                text("  config file not found — create it first").size(11).color(yellow)
+            );
+            continue;
+        }
+
+        // Keybind row
+        let kb_label = if cs.keybind_present {
+            text("  ✓ keybind configured").size(11).color(green)
+        } else {
+            text("  ✗ keybind not found").size(11).color(yellow)
+        };
+        let kb_row = if cs.keybind_present {
+            row![kb_label].spacing(8)
+        } else {
+            let name = cs.name.clone();
+            row![
+                kb_label,
+                button("Add keybind").on_press(Msg::InjectKeybind(name)).padding([3u16, 10u16]),
+            ].spacing(8).align_y(Alignment::Center)
+        };
+        col = col.push(kb_row);
+
+        // Autostart row
+        let as_label = if cs.autostart_present {
+            text("  ✓ autostart configured").size(11).color(green)
+        } else {
+            text("  ✗ autostart not found").size(11).color(yellow)
+        };
+        let as_row = if cs.autostart_present {
+            row![as_label].spacing(8)
+        } else {
+            let name = cs.name.clone();
+            row![
+                as_label,
+                button("Add autostart").on_press(Msg::InjectAutostart(name)).padding([3u16, 10u16]),
+            ].spacing(8).align_y(Alignment::Center)
+        };
+        col = col.push(as_row);
+    }
+
+    // If nothing installed at all, fall back to static reference
+    let any_installed = s.comp_statuses.iter().any(|c| c.installed);
+    if !any_installed {
+        col = col.push(text("No supported compositors detected.").size(12).color(dim));
+    }
+
+    scrollable(col.push(Space::new())).into()
 }
 
 // ── Bar tab ───────────────────────────────────────────────────────────────────
@@ -543,6 +815,523 @@ fn view_overview(s: &App) -> Element<'_, Msg> {
     ].spacing(14).padding([32u16, 32u16])).into()
 }
 
+// ── Plugins tab ──────────────────────────────────────────────────────────────
+
+fn view_plugins(s: &App) -> Element<'_, Msg> {
+    let green  = Color::from_rgb(0.63, 0.85, 0.63);
+    let dim    = Color::from_rgb(0.55, 0.55, 0.55);
+    let yellow = Color::from_rgb(0.95, 0.85, 0.45);
+
+    let plugins = build_plugin_views(s);
+
+    let mut col = column![
+        text("Plugins").size(22),
+        text("Install and manage woven plugins from the official repository.").size(11),
+        rule::horizontal(1),
+        row![
+            button(if s.plugins_loading { "Fetching..." } else { "Refresh from GitHub" })
+                .on_press_maybe(if s.plugins_loading { None } else { Some(Msg::PluginsFetch) })
+                .padding([6u16, 16u16]),
+            Space::new().width(Length::Fill),
+            text(&s.plugins_status).size(11).color(dim),
+        ].spacing(12).align_y(Alignment::Center),
+        rule::horizontal(1),
+    ].spacing(14).padding([32u16, 32u16]);
+
+    if plugins.is_empty() {
+        col = col.push(
+            text("Press \"Refresh from GitHub\" to load available plugins.").size(12).color(dim)
+        );
+    }
+
+    for p in plugins {
+        let status_color = if p.enabled { green } else if p.installed { yellow } else { dim };
+        let status_text = if p.enabled { "enabled" } else if p.installed { "installed" } else { "available" };
+
+        let mut action_row = row![].spacing(6).align_y(Alignment::Center);
+
+        if !p.installed && p.download_url.is_some() {
+            action_row = action_row.push(
+                button("Install").on_press(Msg::PluginInstall(p.name.clone()))
+                    .padding([3u16, 10u16])
+            );
+        }
+        if p.installed && !p.enabled {
+            action_row = action_row.push(
+                button("Enable").on_press(Msg::PluginEnable(p.name.clone()))
+                    .padding([3u16, 10u16])
+            );
+            action_row = action_row.push(
+                button("Remove").on_press(Msg::PluginRemove(p.name.clone()))
+                    .padding([3u16, 10u16])
+            );
+        }
+        if p.enabled {
+            action_row = action_row.push(
+                button("Disable").on_press(Msg::PluginDisable(p.name.clone()))
+                    .padding([3u16, 10u16])
+            );
+            // Add Settings button for plugins that need configuration
+            if plugin_needs_settings(&p.name) {
+                action_row = action_row.push(
+                    button("Settings").on_press(Msg::PluginSettings(p.name.clone()))
+                        .padding([3u16, 10u16])
+                );
+            }
+        }
+
+        col = col.push(
+            container(
+                row![
+                    column![
+                        text(p.name).size(14),
+                        text(status_text).size(11).color(status_color),
+                    ].spacing(2).width(Length::Fill),
+                    action_row,
+                ].align_y(Alignment::Center).spacing(12)
+            ).padding([8u16, 12u16])
+            .style(|_: &Theme| container::Style {
+                border: iced::Border {
+                    radius: 6.0.into(), width: 1.0,
+                    color: Color::from_rgba(1.0, 1.0, 1.0, 0.08),
+                },
+                ..Default::default()
+            })
+        );
+    }
+
+    scrollable(col.push(Space::new())).into()
+}
+
+/// Render the plugin settings modal overlay.
+fn view_plugin_settings_modal<'a>(s: &'a App, plugin_name: &'a str) -> Element<'a, Msg> {
+    use iced::widget::mouse_area;
+    
+    // Modal content
+    let modal_content = match plugin_name {
+        "date"      => view_date_settings(s),
+        "cava"      => view_cava_settings(s),
+        "app_rules" => view_app_rules_settings(s),
+        "launcher"  => view_launcher_settings(s),
+        _ => column![text("No settings available")].into(),
+    };
+
+    let modal = container(
+        column![
+            row![
+                text(format!("{} Settings", plugin_name)).size(18),
+                Space::new().width(Length::Fill),
+                button("✕").on_press(Msg::PluginSettingsClose).padding([4u16, 10u16]),
+            ].align_y(Alignment::Center),
+            rule::horizontal(1),
+            modal_content,
+            rule::horizontal(1),
+            row![
+                button("Save").on_press(Msg::PluginSettingsSave).padding([6u16, 16u16]),
+                button("Cancel").on_press(Msg::PluginSettingsClose).padding([6u16, 16u16]),
+            ].spacing(8),
+        ].spacing(14).padding(20)
+    )
+    .width(Length::Fixed(500.0))
+    .style(|_: &Theme| container::Style {
+        background: Some(Color::from_rgb(0.12, 0.12, 0.18).into()),
+        border: iced::Border {
+            radius: 8.0.into(),
+            width: 1.0,
+            color: Color::from_rgba(1.0, 1.0, 1.0, 0.12),
+        },
+        ..Default::default()
+    });
+
+    // Backdrop that closes modal when clicked
+    let backdrop = mouse_area(
+        container(
+            container(modal)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_: &Theme| container::Style {
+            background: Some(Color::from_rgba(0.0, 0.0, 0.0, 0.5).into()),
+            ..Default::default()
+        })
+    ).on_press(Msg::PluginSettingsClose);
+
+    backdrop.into()
+}
+
+/// Date plugin settings UI.
+fn view_date_settings(s: &App) -> Element<'_, Msg> {
+    let accent = s.plugin_settings_data.get("accent").map(|s| s.as_str()).unwrap_or("#cba6f7");
+    let text_col = s.plugin_settings_data.get("text").map(|s| s.as_str()).unwrap_or("#cdd6f4");
+
+    column![
+        text("Date Badge Colors").size(14),
+        row![
+            text("Accent").size(12).width(100),
+            text_input("#rrggbb", accent)
+                .on_input(|v| Msg::PluginSettingUpdate {
+                    plugin: "date".into(), key: "accent".into(), value: v,
+                })
+                .width(130).padding(6u16),
+            swatch(accent),
+        ].spacing(8).align_y(Alignment::Center),
+        row![
+            text("Text").size(12).width(100),
+            text_input("#rrggbb", text_col)
+                .on_input(|v| Msg::PluginSettingUpdate {
+                    plugin: "date".into(), key: "text".into(), value: v,
+                })
+                .width(130).padding(6u16),
+            swatch(text_col),
+        ].spacing(8).align_y(Alignment::Center),
+    ].spacing(10).into()
+}
+
+/// Cava plugin settings UI.
+fn view_cava_settings(s: &App) -> Element<'_, Msg> {
+    let theme = s.plugin_settings_data.get("theme").map(|s| s.as_str()).unwrap_or("catppuccin");
+    let themes: Vec<&str> = vec!["catppuccin", "gruvbox", "nord", "tokyo_night", "dracula"];
+
+    column![
+        text("Audio Visualizer").size(14),
+        row![
+            text("Color theme").size(12).width(100),
+            pick_list(themes, Some(theme), |selected: &str| {
+                Msg::PluginSettingUpdate {
+                    plugin: "cava".into(), key: "theme".into(), value: selected.into(),
+                }
+            }).width(180),
+        ].spacing(8).align_y(Alignment::Center),
+        text("Themes match your favorite color palettes.").size(10).color(Color::from_rgb(0.5, 0.5, 0.5)),
+    ].spacing(10).into()
+}
+
+/// App rules settings UI — per-app accent color overrides.
+fn view_app_rules_settings(s: &App) -> Element<'_, Msg> {
+    let dim = Color::from_rgb(0.5, 0.5, 0.5);
+    let count: usize = s.plugin_settings_data.get("rule_count")
+        .and_then(|v| v.parse().ok()).unwrap_or(0);
+
+    let mut col = column![
+        text("Per-app accent colors").size(14),
+        text("Override auto-generated hash colors for specific window classes.").size(10).color(dim),
+    ].spacing(8);
+
+    for i in 0..count {
+        let class = s.plugin_settings_data.get(&format!("rule_{}_class", i))
+            .map(|s| s.as_str()).unwrap_or("");
+        let color = s.plugin_settings_data.get(&format!("rule_{}_color", i))
+            .map(|s| s.as_str()).unwrap_or("#89b4fa");
+        let idx = i;
+        col = col.push(
+            row![
+                text_input("class name", class)
+                    .on_input(move |v| Msg::PluginSettingUpdate {
+                        plugin: "app_rules".into(),
+                        key: format!("rule_{}_class", idx),
+                        value: v,
+                    })
+                    .width(150).padding(5u16),
+                text_input("#rrggbb", color)
+                    .on_input(move |v| Msg::PluginSettingUpdate {
+                        plugin: "app_rules".into(),
+                        key: format!("rule_{}_color", idx),
+                        value: v,
+                    })
+                    .width(120).padding(5u16),
+                swatch(color),
+                button("x").on_press(Msg::AppRuleRemove(i.to_string())).padding([3u16, 8u16]),
+            ].spacing(6).align_y(Alignment::Center)
+        );
+    }
+
+    // Add new rule row
+    col = col.push(
+        row![
+            text_input("class name", &s.app_rules_new_class)
+                .on_input(Msg::AppRuleNewClassChanged)
+                .width(150).padding(5u16),
+            text_input("#rrggbb", &s.app_rules_new_color)
+                .on_input(Msg::AppRuleNewColorChanged)
+                .width(120).padding(5u16),
+            swatch(&s.app_rules_new_color),
+            button("+").on_press(Msg::AppRuleAdd).padding([3u16, 8u16]),
+        ].spacing(6).align_y(Alignment::Center)
+    );
+
+    scrollable(col).height(Length::Fixed(300.0)).into()
+}
+
+/// Launcher plugin settings UI with installed app detection.
+fn view_launcher_settings(s: &App) -> Element<'_, Msg> {
+    let current_cmd = s.plugin_settings_data.get("cmd").map(|s| s.as_str()).unwrap_or("kitty");
+
+    let apps_to_check = vec![
+        "kitty", "alacritty", "foot", "wezterm", "konsole",
+        "gnome-terminal", "xfce4-terminal", "firefox", "chromium",
+        "brave", "nautilus", "thunar", "dolphin",
+    ];
+    let installed_apps: Vec<&str> = apps_to_check.iter()
+        .filter(|&&app| is_app_installed(app))
+        .copied()
+        .collect();
+
+    if installed_apps.is_empty() {
+        return column![
+            text("No supported apps detected").size(14),
+            text("Install one of: kitty, alacritty, foot, firefox, etc.").size(11),
+        ].spacing(10).into();
+    }
+
+    column![
+        text("Application Launcher").size(14),
+        row![
+            text("App").size(12).width(100),
+            pick_list(installed_apps, Some(current_cmd), |selected: &str| {
+                Msg::PluginSettingUpdate {
+                    plugin: "launcher".into(), key: "cmd".into(), value: selected.into(),
+                }
+            }).width(180),
+        ].spacing(8).align_y(Alignment::Center),
+        text(format!("Will launch: {}", current_cmd)).size(10).color(Color::from_rgb(0.5, 0.5, 0.5)),
+    ].spacing(10).into()
+}
+
+fn plugins_dir() -> std::path::PathBuf {
+    let base = std::env::var("XDG_CONFIG_HOME")
+        .unwrap_or_else(|_| format!("{}/.config",
+            std::env::var("HOME").unwrap_or_else(|_| ".".into())));
+    std::path::PathBuf::from(format!("{}/woven/plugins", base))
+}
+
+/// Fetch the list of .lua files from the GitHub repo plugins/ directory.
+fn fetch_plugin_list() -> Vec<PluginRemote> {
+    let url = "https://api.github.com/repos/viewerofall/woven/contents/plugins";
+    let resp = ureq::get(url)
+        .header("Accept", "application/vnd.github.v3+json")
+        .header("User-Agent", "woven-ctrl")
+        .call();
+    let body = match resp {
+        Ok(r) => r.into_body().read_to_string().unwrap_or_default(),
+        Err(_) => return Vec::new(),
+    };
+    let items: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap_or_default();
+    items.iter().filter_map(|item| {
+        let name = item["name"].as_str()?;
+        if !name.ends_with(".lua") { return None; }
+        let stem = name.strip_suffix(".lua")?;
+        let download_url = item["download_url"].as_str()?.to_string();
+        Some(PluginRemote {
+            name: stem.to_string(),
+            filename: name.to_string(),
+            download_url,
+        })
+    }).collect()
+}
+
+/// Download a plugin .lua file to the plugins directory.
+fn install_plugin(_name: &str, filename: &str, url: &str) -> Result<(), String> {
+    let dir = plugins_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let resp = ureq::get(url)
+        .header("User-Agent", "woven-ctrl")
+        .call()
+        .map_err(|e| e.to_string())?;
+    let body = resp.into_body().read_to_string().map_err(|e| e.to_string())?;
+    let path = dir.join(filename);
+    std::fs::write(&path, &body).map_err(|e| e.to_string())
+}
+
+/// Build a merged list of all known plugins (remote + local).
+fn build_plugin_views(s: &App) -> Vec<PluginView> {
+    let config = read_config();
+    let dir = plugins_dir();
+
+    let mut map: std::collections::BTreeMap<String, PluginView> = std::collections::BTreeMap::new();
+
+    // Remote plugins
+    for p in &s.plugins_remote {
+        map.insert(p.name.clone(), PluginView {
+            name: p.name.clone(),
+            download_url: Some(p.download_url.clone()),
+            installed: false,
+            enabled: false,
+        });
+    }
+
+    // Local plugins
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let fname = entry.file_name().to_string_lossy().to_string();
+            if !fname.ends_with(".lua") { continue; }
+            let stem = fname.strip_suffix(".lua").unwrap_or(&fname).to_string();
+            map.entry(stem.clone()).or_insert_with(|| PluginView {
+                name: stem.clone(),
+                download_url: None,
+                installed: false,
+                enabled: false,
+            }).installed = true;
+        }
+    }
+
+    // Check which are enabled in woven.lua
+    for pv in map.values_mut() {
+        let pattern = format!("require(\"plugins.{}\")", pv.name);
+        let pattern2 = format!("require('plugins.{}')", pv.name);
+        pv.enabled = config.contains(&pattern) || config.contains(&pattern2);
+    }
+
+    map.into_values().collect()
+}
+
+/// Add a require line for a plugin to woven.lua.
+fn enable_plugin_in_config(name: &str) {
+    let config = read_config();
+    // Don't add if already present
+    if config.contains(&format!("require(\"plugins.{}\")", name))
+        || config.contains(&format!("require('plugins.{}')", name))
+    {
+        return;
+    }
+    let require_line = format!("require(\"plugins.{}\").setup()", name);
+    let new_config = format!("{}\n{}\n", config.trim_end(), require_line);
+    let _ = write_config(&new_config);
+}
+
+/// Remove the require line for a plugin from woven.lua.
+fn disable_plugin_in_config(name: &str) {
+    let config = read_config();
+    // Match exact require patterns to avoid clobbering similar names
+    // (e.g. "date" must not match "date_extended") or removing comments.
+    let pat_dq = format!("require(\"plugins.{}\")", name);
+    let pat_sq = format!("require('plugins.{}')", name);
+    let new_config: String = config.lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            // Skip commented-out lines
+            if trimmed.starts_with("--") { return true; }
+            // Only remove lines that contain the exact require pattern
+            !trimmed.contains(&pat_dq) && !trimmed.contains(&pat_sq)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let new_config = format!("{}\n", new_config.trim_end());
+    let _ = write_config(&new_config);
+}
+
+/// Determine if a plugin needs a settings button.
+fn plugin_needs_settings(name: &str) -> bool {
+    matches!(name, "date" | "cava" | "app_rules" | "launcher")
+}
+
+/// Check if an app is installed on the system.
+fn is_app_installed(app: &str) -> bool {
+    std::process::Command::new("which")
+        .arg(app)
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// Load current settings for a plugin from the config file.
+fn load_plugin_settings(name: &str) -> std::collections::HashMap<String, String> {
+    let mut settings = std::collections::HashMap::new();
+    let config = read_config();
+    let opts = extract_plugin_opts(&config, name);
+
+    match name {
+        "date" => {
+            settings.insert("accent".into(),
+                lua_str(&opts, "accent").unwrap_or_else(|| "#cba6f7".into()));
+            settings.insert("text".into(),
+                lua_str(&opts, "text").unwrap_or_else(|| "#cdd6f4".into()));
+        }
+        "cava" => {
+            settings.insert("theme".into(),
+                lua_str(&opts, "theme").unwrap_or_else(|| "catppuccin".into()));
+        }
+        "app_rules" => {
+            let rules = parse_lua_bracket_table(&opts);
+            settings.insert("rule_count".into(), rules.len().to_string());
+            for (i, (class, color)) in rules.iter().enumerate() {
+                settings.insert(format!("rule_{}_class", i), class.clone());
+                settings.insert(format!("rule_{}_color", i), color.clone());
+            }
+        }
+        "launcher" => {
+            settings.insert("cmd".into(),
+                lua_str(&opts, "cmd").unwrap_or_else(|| "kitty".into()));
+            settings.insert("label".into(),
+                lua_str(&opts, "label").unwrap_or_else(|| "kitty".into()));
+        }
+        _ => {}
+    }
+
+    settings
+}
+
+/// Apply plugin settings by updating the config file.
+fn apply_plugin_settings(name: &str, settings: &std::collections::HashMap<String, String>) -> bool {
+    let config = read_config();
+
+    // Preserve existing widget opts (slot, height, interval) from the current call
+    let opts = extract_plugin_opts(&config, name);
+    let slot     = lua_str(&opts, "slot").unwrap_or_default();
+    let height   = lua_num(&opts, "height").unwrap_or_default();
+    let interval = lua_num(&opts, "interval").unwrap_or_default();
+
+    let widget_opts = if !slot.is_empty() {
+        format!("slot = \"{}\", height = {}, interval = {}", slot, height, interval)
+    } else {
+        String::new()
+    };
+
+    let block = match name {
+        "date" => {
+            let accent = settings.get("accent").cloned().unwrap_or_else(|| "#cba6f7".into());
+            let txt    = settings.get("text").cloned().unwrap_or_else(|| "#cdd6f4".into());
+            format!(
+                "require(\"plugins.date\").setup({{ {}, accent = \"{}\", text = \"{}\" }})",
+                widget_opts, accent, txt
+            )
+        }
+        "cava" => {
+            let theme = settings.get("theme").cloned().unwrap_or_else(|| "catppuccin".into());
+            format!(
+                "require(\"plugins.cava\").setup({{ {}, theme = \"{}\" }})",
+                widget_opts, theme
+            )
+        }
+        "app_rules" => {
+            let count: usize = settings.get("rule_count")
+                .and_then(|s| s.parse().ok()).unwrap_or(0);
+            let entries: String = (0..count)
+                .filter_map(|i| {
+                    let class = settings.get(&format!("rule_{}_class", i))?;
+                    let color = settings.get(&format!("rule_{}_color", i))?;
+                    if class.is_empty() { return None; }
+                    Some(format!("    [\"{}\"] = \"{}\",\n", class, color))
+                })
+                .collect();
+            format!("require(\"plugins.app_rules\").setup({{\n{}}})", entries)
+        }
+        "launcher" => {
+            let cmd   = settings.get("cmd").cloned().unwrap_or_else(|| "kitty".into());
+            let label = settings.get("label").cloned().unwrap_or_else(|| cmd.clone());
+            format!(
+                "require(\"plugins.launcher\").setup({{ {}, label = \"{}\", cmd = \"{}\" }})",
+                widget_opts, label, cmd
+            )
+        }
+        _ => return false,
+    };
+
+    let new_config = splice_plugin_setup(&config, name, &block);
+    write_config(&new_config).is_ok()
+}
+
 // ── Config tab ────────────────────────────────────────────────────────────────
 
 fn view_config(s: &App) -> Element<'_, Msg> {
@@ -591,10 +1380,6 @@ fn cli_ref<'a>(cmd: &'a str, desc: &'a str) -> Element<'a, Msg> {
         text(cmd).size(12).font(Font::MONOSPACE).width(300),
         text(desc).size(12),
     ].spacing(8).align_y(Alignment::Center).into()
-}
-
-fn mono(s: &str) -> Element<'_, Msg> {
-    text(s).size(11).font(Font::MONOSPACE).into()
 }
 
 fn hex_color(hex: &str) -> Color {
@@ -648,6 +1433,110 @@ fn preview_card<'a>(bg: &str, accent: &str, border: &str, txt: &str) -> Element<
     }).into()
 }
 
+// ── self-update ──────────────────────────────────────────────────────────────
+
+fn self_update() {
+    use std::process::Command;
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let bin_dir = format!("{}/.local/bin", home);
+    let config_dir = format!("{}/.config/woven", home);
+    let service_dir = format!("{}/.config/systemd/user", home);
+    let tmp = format!("{}/woven-update-{}", std::env::temp_dir().display(), std::process::id());
+
+    let run = |name: &str, cmd: &mut Command| -> bool {
+        match cmd.status() {
+            Ok(s) if s.success() => true,
+            Ok(s) => { eprintln!("  {} exited with {}", name, s); false }
+            Err(e) => { eprintln!("  {} failed: {}", name, e); false }
+        }
+    };
+
+    println!("==> Stopping woven daemon...");
+    let _ = Command::new("systemctl").args(["--user", "stop", "woven"]).status();
+    // Wait for the process to fully exit so binary files are no longer busy
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    println!("==> Downloading latest release...");
+    let _ = std::fs::create_dir_all(&tmp);
+    let tarball = format!("{}/woven.tar.gz", tmp);
+    let url = "https://github.com/viewerofall/woven/releases/latest/download/v2.2.tar.gz";
+    let fallback = "https://raw.githubusercontent.com/viewerofall/woven/main/v2.2.tar.gz";
+
+    let downloaded = run("curl", Command::new("curl").args(["-fsSL", url, "-o", &tarball]))
+        || run("curl (fallback)", Command::new("curl").args(["-fsSL", fallback, "-o", &tarball]));
+
+    if !downloaded {
+        eprintln!("==> Download failed. Restarting old version...");
+        let _ = Command::new("systemctl").args(["--user", "start", "woven"]).status();
+        let _ = std::fs::remove_dir_all(&tmp);
+        return;
+    }
+
+    println!("==> Extracting...");
+    if !run("tar", Command::new("tar").args(["-xzf", &tarball, "-C", &tmp])) {
+        eprintln!("==> Extract failed. Restarting old version...");
+        let _ = Command::new("systemctl").args(["--user", "start", "woven"]).status();
+        let _ = std::fs::remove_dir_all(&tmp);
+        return;
+    }
+
+    // Find extracted directory (first subdir in tmp)
+    let src = std::fs::read_dir(&tmp).ok()
+        .and_then(|mut d| d.find_map(|e| {
+            let e = e.ok()?;
+            if e.file_type().ok()?.is_dir() { Some(e.path()) } else { None }
+        }))
+        .unwrap_or(std::path::PathBuf::from(&tmp));
+
+    println!("==> Installing binaries...");
+    let _ = std::fs::create_dir_all(&bin_dir);
+    let exec_dir = src.join("exec");
+    if exec_dir.exists() {
+        for bin in ["woven", "woven-ctrl"] {
+            let from = exec_dir.join(bin);
+            if from.exists() {
+                let to = format!("{}/{}", bin_dir, bin);
+                let tmp_to = format!("{}.new", to);
+                // Copy to a temp name, then rename over the old binary.
+                // rename() is atomic and avoids ETXTBSY — the kernel keeps
+                // the old inode alive for the running process but the
+                // directory entry now points to the new file.
+                if let Err(e) = std::fs::copy(&from, &tmp_to) {
+                    eprintln!("  failed to copy {}: {}", bin, e);
+                } else if let Err(e) = std::fs::rename(&tmp_to, &to) {
+                    eprintln!("  failed to rename {}: {}", bin, e);
+                    let _ = std::fs::remove_file(&tmp_to);
+                }
+            }
+        }
+    } else {
+        eprintln!("  no exec/ directory in tarball — binaries not updated");
+    }
+
+    println!("==> Updating runtime...");
+    let runtime_src = src.join("runtime");
+    if runtime_src.exists() {
+        run("cp runtime", Command::new("cp").args(["-r",
+            &runtime_src.to_string_lossy(),
+            &format!("{}/", config_dir)]));
+    }
+
+    // Update service file if present
+    let service_src = src.join("woven.service");
+    if service_src.exists() {
+        let _ = std::fs::create_dir_all(&service_dir);
+        let _ = std::fs::copy(&service_src, format!("{}/woven.service", service_dir));
+    }
+
+    println!("==> Reloading and starting...");
+    let _ = Command::new("systemctl").args(["--user", "daemon-reload"]).status();
+    run("systemctl start", Command::new("systemctl").args(["--user", "start", "woven"]));
+
+    let _ = std::fs::remove_dir_all(&tmp);
+    println!("==> woven updated successfully.");
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 fn main() -> iced::Result {
@@ -656,7 +1545,22 @@ fn main() -> iced::Result {
             "--show"   => { send_ipc(IpcCommand::Show);         return Ok(()); }
             "--hide"   => { send_ipc(IpcCommand::Hide);         return Ok(()); }
             "--toggle" => { send_ipc(IpcCommand::Toggle);       return Ok(()); }
-            "--reload" => { send_ipc(IpcCommand::ReloadConfig); return Ok(()); }
+            "--reload" => {
+                // Full reload: restart the daemon so all config (theme, plugins,
+                // bar, namer, widgets, animations) is re-evaluated from scratch.
+                // A partial in-process hot-reload only covered theme — this is
+                // the only way to pick up plugin/widget/namer changes.
+                let status = std::process::Command::new("systemctl")
+                    .args(["--user", "restart", "woven"])
+                    .status();
+                match status {
+                    Ok(s) if s.success() => eprintln!("woven reloaded."),
+                    Ok(s)  => eprintln!("reload failed (exit {})", s),
+                    Err(e) => eprintln!("reload failed: {}", e),
+                }
+                return Ok(());
+            }
+            "--update" => { self_update(); return Ok(()); }
             "--setup"  => {
                 return iced::application(setup::Setup::init, setup::update, setup::view)
                     .title(|_: &setup::Setup| "woven — first time setup".to_string())
