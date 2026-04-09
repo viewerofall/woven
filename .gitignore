@@ -2,12 +2,17 @@
 /target
 **/*.rs.bk
 
+# aur shit
+PKGBUILD
+.SRCINFO
+
 # Release tarballs
 *.tar.gz
 *.tar.xz
 *.tar.zst
 
-# makepkg working dirs
+# useless stuff
+*.lock
 src/
 pkg/
 
