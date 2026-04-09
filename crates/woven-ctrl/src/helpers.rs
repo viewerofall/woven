@@ -413,6 +413,43 @@ pub fn splice_plugin_setup(config: &str, plugin: &str, block: &str) -> String {
     format!("{}\n{}\n", config.trim_end(), block)
 }
 
+/// Parse `key = "value"` from a comma-separated (or line-separated) opts string.
+/// Unlike `lua_str`, this works for single-line plugin opts.
+pub fn opt_str(src: &str, key: &str) -> Option<String> {
+    for seg in src.split([',', '\n']) {
+        let t = seg.trim();
+        if !t.starts_with(key) { continue; }
+        let after = &t[key.len()..];
+        if !after.starts_with([' ', '\t', '=']) { continue; }
+        let after = after.trim_start_matches([' ', '\t']);
+        let after = after.strip_prefix('=')?;
+        let after = after.trim_start_matches([' ', '\t']);
+        let after = after.strip_prefix('"')?;
+        let end   = after.find('"')?;
+        return Some(after[..end].to_string());
+    }
+    None
+}
+
+/// Parse `key = <number>` from a comma-separated (or line-separated) opts string.
+pub fn opt_num(src: &str, key: &str) -> Option<String> {
+    for seg in src.split([',', '\n']) {
+        let t = seg.trim();
+        if !t.starts_with(key) { continue; }
+        let after = &t[key.len()..];
+        if !after.starts_with([' ', '\t', '=']) { continue; }
+        let after = after.trim_start_matches([' ', '\t']);
+        let after = after.strip_prefix('=')?;
+        let after = after.trim_start_matches([' ', '\t']);
+        if after.starts_with('"') { continue; } // skip string values
+        let end = after.find([',', ' ', '}', '\n']).unwrap_or(after.len());
+        let v = after[..end].trim();
+        if v.is_empty() { return None; }
+        return Some(v.to_string());
+    }
+    None
+}
+
 /// Parse `["key"] = "value"` pairs from a Lua table snippet.
 pub fn parse_lua_bracket_table(src: &str) -> Vec<(String, String)> {
     let mut results = Vec::new();

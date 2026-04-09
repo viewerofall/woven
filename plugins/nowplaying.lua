@@ -12,7 +12,8 @@ local function trunc(s, n)
     local len = utf8.len(s) or #s
     if len <= n then return s end
     -- Walk n-1 codepoints to find the safe byte offset
-    local i = 0
+    -- i must start at 1 (Lua byte positions are 1-indexed; 0 is invalid for utf8.offset)
+    local i = 1
     for _ = 1, n - 1 do
         i = utf8.offset(s, 2, i) or (#s + 1)
         if i > #s then break end

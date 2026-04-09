@@ -1,2 +1,24 @@
+# Build output
 /target
-Cargo.lock
+**/*.rs.bk
+
+# Release tarballs
+*.tar.gz
+*.tar.xz
+*.tar.zst
+
+# makepkg working dirs
+src/
+pkg/
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

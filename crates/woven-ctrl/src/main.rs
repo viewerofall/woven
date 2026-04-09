@@ -991,8 +991,8 @@ fn view_plugin_settings_modal<'a>(s: &'a App, plugin_name: &'a str) -> Element<'
 
 /// Date plugin settings UI.
 fn view_date_settings(s: &App) -> Element<'_, Msg> {
-    let accent = s.plugin_settings_data.get("accent").map(|s| s.as_str()).unwrap_or("#cba6f7");
-    let text_col = s.plugin_settings_data.get("text").map(|s| s.as_str()).unwrap_or("#cdd6f4");
+    let accent = s.plugin_settings_data.get("accent_color").map(|s| s.as_str()).unwrap_or("#cba6f7");
+    let text_col = s.plugin_settings_data.get("text_color").map(|s| s.as_str()).unwrap_or("#cdd6f4");
 
     column![
         text("Date Badge Colors").size(14),
@@ -1000,7 +1000,7 @@ fn view_date_settings(s: &App) -> Element<'_, Msg> {
             text("Accent").size(12).width(100),
             text_input("#rrggbb", accent)
                 .on_input(|v| Msg::PluginSettingUpdate {
-                    plugin: "date".into(), key: "accent".into(), value: v,
+                    plugin: "date".into(), key: "accent_color".into(), value: v,
                 })
                 .width(130).padding(6u16),
             swatch(accent),
@@ -1009,7 +1009,7 @@ fn view_date_settings(s: &App) -> Element<'_, Msg> {
             text("Text").size(12).width(100),
             text_input("#rrggbb", text_col)
                 .on_input(|v| Msg::PluginSettingUpdate {
-                    plugin: "date".into(), key: "text".into(), value: v,
+                    plugin: "date".into(), key: "text_color".into(), value: v,
                 })
                 .width(130).padding(6u16),
             swatch(text_col),
@@ -1271,14 +1271,14 @@ fn load_plugin_settings(name: &str) -> std::collections::HashMap<String, String>
 
     match name {
         "date" => {
-            settings.insert("accent".into(),
-                lua_str(&opts, "accent").unwrap_or_else(|| "#cba6f7".into()));
-            settings.insert("text".into(),
-                lua_str(&opts, "text").unwrap_or_else(|| "#cdd6f4".into()));
+            settings.insert("accent_color".into(),
+                opt_str(&opts, "accent_color").unwrap_or_else(|| "#cba6f7".into()));
+            settings.insert("text_color".into(),
+                opt_str(&opts, "text_color").unwrap_or_else(|| "#cdd6f4".into()));
         }
         "cava" => {
             settings.insert("theme".into(),
-                lua_str(&opts, "theme").unwrap_or_else(|| "catppuccin".into()));
+                opt_str(&opts, "theme").unwrap_or_else(|| "catppuccin".into()));
         }
         "app_rules" => {
             let rules = parse_lua_bracket_table(&opts);
@@ -1289,10 +1289,8 @@ fn load_plugin_settings(name: &str) -> std::collections::HashMap<String, String>
             }
         }
         "launcher" => {
-            settings.insert("cmd".into(),
-                lua_str(&opts, "cmd").unwrap_or_else(|| "kitty".into()));
-            settings.insert("label".into(),
-                lua_str(&opts, "label").unwrap_or_else(|| "kitty".into()));
+            let cmd = opt_str(&opts, "cmd").unwrap_or_else(|| "kitty".into());
+            settings.insert("cmd".into(), cmd);
         }
         _ => {}
     }
@@ -1309,30 +1307,39 @@ fn apply_plugin_settings_dry(
     config: &str,
 ) -> Option<String> {
     let opts     = extract_plugin_opts(config, name);
-    let slot     = lua_str(&opts, "slot").unwrap_or_default();
-    let height   = lua_num(&opts, "height").unwrap_or_default();
-    let interval = lua_num(&opts, "interval").unwrap_or_default();
+    // Use opt_str/opt_num — they handle both inline (single-line) and multi-line opts.
+    let slot     = opt_str(&opts, "slot").unwrap_or_default();
+    let height   = opt_num(&opts, "height").unwrap_or_default();
+    let interval = opt_num(&opts, "interval").unwrap_or_default();
 
+    // Build positional opts only when we actually have them, to avoid a
+    // leading comma like `{ , key = val }` (invalid Lua).
     let widget_opts = if !slot.is_empty() {
-        format!("slot = \"{}\", height = {}, interval = {}", slot, height, interval)
+        let h = if height.is_empty() { "0".to_string() } else { height };
+        let i = if interval.is_empty() { "0".to_string() } else { interval };
+        format!("slot = \"{}\", height = {}, interval = {}", slot, h, i)
     } else {
         String::new()
     };
 
+    // Prefix separator: only add ", " between widget_opts and plugin-specific opts
+    // when widget_opts is non-empty.
+    let sep = if widget_opts.is_empty() { "" } else { ", " };
+
     let block = match name {
         "date" => {
-            let accent = settings.get("accent").cloned().unwrap_or_else(|| "#cba6f7".into());
-            let txt    = settings.get("text").cloned().unwrap_or_else(|| "#cdd6f4".into());
+            let accent = settings.get("accent_color").cloned().unwrap_or_else(|| "#cba6f7".into());
+            let txt    = settings.get("text_color").cloned().unwrap_or_else(|| "#cdd6f4".into());
             format!(
-                "require(\"plugins.date\").setup({{ {}, accent = \"{}\", text = \"{}\" }})",
-                widget_opts, accent, txt
+                "require(\"plugins.date\").setup({{ {}{}accent_color = \"{}\", text_color = \"{}\" }})",
+                widget_opts, sep, accent, txt
             )
         }
         "cava" => {
             let theme = settings.get("theme").cloned().unwrap_or_else(|| "catppuccin".into());
             format!(
-                "require(\"plugins.cava\").setup({{ {}, theme = \"{}\" }})",
-                widget_opts, theme
+                "require(\"plugins.cava\").setup({{ {}{}theme = \"{}\" }})",
+                widget_opts, sep, theme
             )
         }
         "app_rules" => {
@@ -1349,11 +1356,11 @@ fn apply_plugin_settings_dry(
             format!("require(\"plugins.app_rules\").setup({{\n{}}})", entries)
         }
         "launcher" => {
-            let cmd   = settings.get("cmd").cloned().unwrap_or_else(|| "kitty".into());
-            let label = settings.get("label").cloned().unwrap_or_else(|| cmd.clone());
+            // Always sync label = cmd so the icon updates when the app changes.
+            let cmd = settings.get("cmd").cloned().unwrap_or_else(|| "kitty".into());
             format!(
-                "require(\"plugins.launcher\").setup({{ {}, label = \"{}\", cmd = \"{}\" }})",
-                widget_opts, label, cmd
+                "require(\"plugins.launcher\").setup({{ {}{}label = \"{}\", cmd = \"{}\" }})",
+                widget_opts, sep, cmd, cmd
             )
         }
         _ => return None,
@@ -1499,8 +1506,8 @@ fn self_update() {
     println!("==> Downloading latest release...");
     let _ = std::fs::create_dir_all(&tmp);
     let tarball = format!("{}/woven.tar.gz", tmp);
-    let url = "https://github.com/viewerofall/woven/releases/latest/download/v2.2.tar.gz";
-    let fallback = "https://raw.githubusercontent.com/viewerofall/woven/main/v2.2.tar.gz";
+    let url = "https://github.com/viewerofall/woven/releases/latest/download/v2.2.2.tar.gz";
+    let fallback = "https://raw.githubusercontent.com/viewerofall/woven/main/v2.2.2.tar.gz";
 
     let downloaded = run("curl", Command::new("curl").args(["-fsSL", url, "-o", &tarball]))
         || run("curl (fallback)", Command::new("curl").args(["-fsSL", fallback, "-o", &tarball]));
