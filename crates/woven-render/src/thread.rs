@@ -10,9 +10,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::thread;
 use tracing::{error, info, warn};
-use woven_common::types::{AnimationConfig, BarConfig, BarPosition, DrawCmd, EasingCurve, LayoutConfig, Theme, WidgetDef, Workspace, WorkspaceMetrics};
-
-use crate::bar_surface::{BarSurface, BAR_THICK, PANEL_THICK};
+use woven_common::types::{AnimationConfig, EasingCurve, LayoutConfig, Theme, Workspace, WorkspaceMetrics};
 use crate::draw::Painter;
 use crate::surface::{WovenSurface, MouseEvent};
 use crate::thumbnail::ThumbnailCapturer;
@@ -28,8 +26,6 @@ pub enum RenderCmd {
     /// The compositor just made workspace `ws_id` active — capture the output
     /// and store it as that workspace's screenshot.
     CaptureForWorkspace(u32),
-    /// Apply new bar configuration (creates or destroys the bar surface).
-    UpdateBarConfig(BarConfig),
     /// Apply new layout dimensions from `woven.layout({})`.
     UpdateLayout(LayoutConfig),
     /// Register plugin icon overrides — class (lowercase) → absolute PNG path.
@@ -37,10 +33,6 @@ pub enum RenderCmd {
     UpdateIconOverrides { map: std::collections::HashMap<String, String>, default_icon: Option<String> },
     /// Apply per-app accent color rules from `woven.rules({})`.
     UpdateAppRules(std::collections::HashMap<String, String>),
-    /// Register a new bar widget (idempotent — re-registration replaces old def).
-    RegisterWidget(WidgetDef),
-    /// Push fresh draw-command content for a registered widget.
-    UpdateWidgetContent { id: String, cmds: Vec<DrawCmd> },
     /// Show an error toast notification on the overlay.
     ShowToast { message: String, duration_ms: u32 },
     Shutdown,
@@ -117,8 +109,7 @@ fn render_loop(
 ) -> Result<()> {
     info!("render loop starting");
 
-    let (mouse_tx, mouse_rx)         = unbounded::<MouseEvent>();
-    let (bar_mouse_tx, bar_mouse_rx) = unbounded::<MouseEvent>();
+    let (mouse_tx, mouse_rx) = unbounded::<MouseEvent>();
 
     let mut surface     = WovenSurface::new(mouse_tx)?;
     let mut painter     = Painter::new(theme, anims.clone(), action_tx.clone());
@@ -126,13 +117,6 @@ fn render_loop(
     let mut visible      = false;
     let mut pending_hide = false;
     let mut pending_show = false;
-
-    // Bar surface — created on demand by UpdateBarConfig from Lua.
-    // Keep a clone of bar_mouse_tx so we can recreate the bar if config changes.
-    let bar_mouse_tx_store = bar_mouse_tx.clone();
-    let mut bar_surface: Option<BarSurface> = None;
-    let mut bar_visible  = true;
-    let mut bar_position = BarPosition::Right;
 
     let mut anim_t:     f32             = 0.0;
     let mut anim_target: f32            = 0.0;
@@ -189,18 +173,6 @@ fn render_loop(
                         tc.request_output_for_ws(ws_id, 0);
                     }
                 }
-                RenderCmd::UpdateBarConfig(cfg) => {
-                    bar_position = cfg.position.clone();
-                    bar_visible  = true;
-                    if cfg.enabled {
-                        match BarSurface::new(&cfg.position, bar_mouse_tx_store.clone()) {
-                            Ok(mut b) => { let _ = b.dispatch(); bar_surface = Some(b); }
-                            Err(e)    => warn!("bar surface: {e:#}"),
-                        }
-                    } else {
-                        bar_surface = None;
-                    }
-                }
                 RenderCmd::UpdateTheme(t)  => painter.update_theme(t),
                 RenderCmd::UpdateLayout(l) => painter.update_layout(l),
                 RenderCmd::UpdateIconOverrides { map, default_icon } => {
@@ -217,8 +189,6 @@ fn render_loop(
                         anim_from = anim_t; anim_target = 1.0; anim_start = std::time::Instant::now();
                     }
                 }
-                RenderCmd::RegisterWidget(def) => painter.register_widget(def),
-                RenderCmd::UpdateWidgetContent { id, cmds } => painter.update_widget_content(id, cmds),
                 RenderCmd::UpdateSettings { show_empty } => painter.update_settings(show_empty),
                 RenderCmd::UpdateState { workspaces, metrics } => {
                     painter.update_state(workspaces, metrics);
@@ -228,84 +198,6 @@ fn render_loop(
                     }
                 }
                 RenderCmd::Shutdown => { info!("render thread shutting down"); return Ok(()); }
-            }
-        }
-
-        // ── bar dispatch ──────────────────────────────────────────────────────
-        if let Some(ref mut bar) = bar_surface { let _ = bar.dispatch(); }
-
-        // ── bar input ─────────────────────────────────────────────────────────
-        while let Ok(ev) = bar_mouse_rx.try_recv() {
-            match ev {
-                MouseEvent::Press  { x, y } => {
-                    let is_vert = matches!(bar_position, BarPosition::Left | BarPosition::Right);
-                    match painter.on_bar_press(x, y) {
-                        Some(WindowAction::ToggleOverlay) => {
-                            if visible { pending_hide = true; } else { pending_show = true; }
-                        }
-                        Some(WindowAction::HideBar) => {
-                            bar_visible = false;
-                            if let Some(ref mut bar) = bar_surface {
-                                let _ = bar.present_transparent();
-                            }
-                        }
-                        Some(WindowAction::ExpandPanel) => {
-                            painter.set_panel_expanded(true);
-                            if let Some(ref mut bar) = bar_surface {
-                                let _ = bar.resize(PANEL_THICK, is_vert);
-                            }
-                        }
-                        Some(WindowAction::CollapsePanel) => {
-                            painter.set_panel_expanded(false);
-                            if let Some(ref mut bar) = bar_surface {
-                                let _ = bar.resize(BAR_THICK, is_vert);
-                            }
-                        }
-                        Some(WindowAction::PowerSuspend) => {
-                            let _ = std::process::Command::new("systemctl").arg("suspend").spawn();
-                        }
-                        Some(WindowAction::PowerReboot) => {
-                            let _ = std::process::Command::new("systemctl").arg("reboot").spawn();
-                        }
-                        Some(WindowAction::PowerShutdown) => {
-                            let _ = std::process::Command::new("systemctl").arg("poweroff").spawn();
-                        }
-                        Some(WindowAction::PowerLock) => {
-                            let _ = std::process::Command::new("loginctl").arg("lock-session").spawn();
-                        }
-                        Some(WindowAction::PowerLogout) => {
-                            let _ = std::process::Command::new("loginctl")
-                                .args(["kill-user", ""])
-                                .spawn();
-                        }
-                        Some(WindowAction::MediaPlayPause) => {
-                            let _ = std::process::Command::new("playerctl").arg("play-pause").spawn();
-                        }
-                        Some(WindowAction::MediaNext) => {
-                            let _ = std::process::Command::new("playerctl").arg("next").spawn();
-                        }
-                        Some(WindowAction::MediaPrev) => {
-                            let _ = std::process::Command::new("playerctl").arg("previous").spawn();
-                        }
-                        Some(WindowAction::WifiToggle) => {
-                            let _ = std::process::Command::new("nmcli")
-                                .args(["radio", "wifi", "toggle"])
-                                .spawn();
-                        }
-                        Some(WindowAction::BtToggle) => {
-                            let _ = std::process::Command::new("sh")
-                                .args(["-c",
-                                    "bluetoothctl show | grep -q 'Powered: yes' \
-                                     && bluetoothctl power off \
-                                     || bluetoothctl power on"])
-                                .spawn();
-                        }
-                        Some(action) => { let _ = action_tx.try_send(action); }
-                        None => {}
-                    }
-                }
-                MouseEvent::Motion { x, y } => painter.on_bar_motion(x, y),
-                _ => {}
             }
         }
 
@@ -390,18 +282,6 @@ fn render_loop(
                 painter.update_workspace_cache(tc.workspace_cache().clone());
             }
         }
-
-        // ── bar render ────────────────────────────────────────────────────────
-        if let Some(ref mut bar) = bar_surface {
-            if bar_visible {
-                if let Err(e) = bar.present_for_each(|bw, bh| {
-                    painter.paint_bar(bw, bh, &bar_position)
-                }) {
-                    warn!("bar present: {e:#}");
-                }
-            }
-        }
-
 
         // ── draw + present ────────────────────────────────────────────────────
         // Always render while visible OR animating (close anim needs to play out).

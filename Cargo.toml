@@ -6,6 +6,7 @@ members = [
     "crates/woven-ctrl",
     "crates/woven-protocols",
     "crates/woven-plugin",
+    "crates/woven-bar",
 ]
 resolver = "2"
 
@@ -47,6 +48,9 @@ chrono    = { version = "0.4", features = ["clock"] }
 
 # shm + mmap for screencopy frame buffers
 rustix = { version = "1", features = ["event", "mm", "fs", "time"] }
+
+# internal crates
+woven-bar = { path = "crates/woven-bar" }
 
 [profile.release]
 opt-level     = 3

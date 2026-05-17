@@ -1,0 +1,37 @@
+[package]
+name    = "woven-bar"
+version = "0.1.0"
+edition = "2021"
+description = "woven-shell status bar — standalone Wayland layer-shell bar daemon"
+
+[[bin]]
+name = "woven-bar"
+path = "src/main.rs"
+
+[lib]
+name = "woven_bar"
+path = "src/lib.rs"
+
+[dependencies]
+tokio             = { workspace = true }
+anyhow            = { workspace = true }
+thiserror         = { workspace = true }
+crossbeam-channel = { workspace = true }
+serde             = { workspace = true }
+serde_json        = { workspace = true }
+tracing           = { workspace = true }
+tracing-subscriber = { workspace = true }
+tiny-skia         = { workspace = true }
+woven-common      = { path = "../woven-common" }
+chrono            = { workspace = true }
+rustix            = { workspace = true }
+
+smithay-client-toolkit = { workspace = true }
+wayland-client         = { workspace = true }
+wayland-protocols      = { workspace = true }
+wayland-protocols-wlr  = { workspace = true }
+
+png  = "0.17"
+toml = "0.8"
+libc = "0.2"
+ureq = "3"

@@ -162,11 +162,11 @@ async fn main() -> Result<()> {
         anims:       Arc::new(RwLock::new(anims)),
         runtime_dir: runtime_dir.clone(),
         config_path: config_path.clone(),
-        widgets:       Arc::new(std::sync::Mutex::new(Vec::new())),
         event_queue:   Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         hooks:         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         error_handler: Arc::new(std::sync::Mutex::new(None)),
         cava:          Arc::new(std::sync::Mutex::new(None)),
+        bar_shutdown:  Arc::new(std::sync::Mutex::new(None)),
         store:         Arc::new(std::sync::Mutex::new(load_store())),
         namer:         Arc::new(std::sync::Mutex::new(lua::ws_namer::WorkspaceNamer::default())),
     });

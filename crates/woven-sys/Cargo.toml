@@ -12,6 +12,8 @@ path = "src/main.rs"
 [dependencies]
 woven-common = { path = "../woven-common" }
 woven-render = { path = "../woven-render" }
+woven-bar    = { workspace = true }
+toml         = "0.8"
 
 tokio       = { workspace = true }
 anyhow      = { workspace = true }

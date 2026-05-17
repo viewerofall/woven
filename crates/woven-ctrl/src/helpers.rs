@@ -184,32 +184,42 @@ pub fn splice_theme_into_config(config: &str, block: &str) -> String {
 
 // ── Bar ───────────────────────────────────────────────────────────────────────
 
-pub const BAR_POSITIONS: &[&str] = &["right", "left", "top", "bottom"];
+pub const BAR_POSITIONS: &[&str] = &["top", "bottom", "left", "right"];
+pub const BAR_STYLES:    &[&str] = &["bubbles", "solid"];
 
 pub struct ParsedBar {
     pub enabled:  bool,
     pub position: String,
+    pub style:    String,
 }
 
 pub fn parse_bar_from_config() -> ParsedBar {
     let raw = read_config();
     ParsedBar {
         enabled:  lua_bool(&raw, "enabled").unwrap_or(true),
-        position: lua_str(&raw, "position").unwrap_or_else(|| "right".into()),
+        position: lua_str(&raw, "position").unwrap_or_else(|| "bottom".into()),
+        style:    lua_str(&raw, "style").unwrap_or_else(|| "bubbles".into()),
     }
 }
 
-pub fn build_bar_block(enabled: bool, position: &str) -> String {
+pub fn build_bar_block(enabled: bool, position: &str, style: &str) -> String {
     format!(concat!(
         "woven.bar({{\n",
         "    enabled  = {},\n",
         "    position = \"{}\",\n",
+        "    style    = \"{}\",\n",
+        "    height   = 32,\n",
+        "    modules = {{\n",
+        "        left   = {{ \"activities\", \"workspaces\" }},\n",
+        "        center = {{ \"window_title\" }},\n",
+        "        right  = {{ \"cava\", \"|\", \"network\", \"audio\", \"battery\", \"|\", \"clock\", \"date\" }},\n",
+        "    }},\n",
         "}})",
-    ), enabled, position)
+    ), enabled, position, style)
 }
 
 pub fn splice_bar_into_config(config: &str, block: &str) -> String {
-    splice_block(config, "woven.bar({", block)
+    splice_block_deep(config, "woven.bar({", block)
 }
 
 // ── Overview / animations ─────────────────────────────────────────────────────
@@ -334,6 +344,33 @@ pub fn default_config() -> String {
 }
 
 // ── Internal ──────────────────────────────────────────────────────────────────
+
+/// Splice that handles nested `{}` blocks (e.g. woven.bar with modules subtable).
+/// Finds the `})` that closes the outermost call by counting brace depth.
+fn splice_block_deep(config: &str, marker: &str, block: &str) -> String {
+    if let Some(start) = config.find(marker) {
+        let from = start + marker.len() - 1; // position of the opening '{'
+        let bytes = config.as_bytes();
+        let mut depth = 0usize;
+        let mut i = from;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    if depth > 0 { depth -= 1; }
+                    if depth == 0 {
+                        // closing '}', check for ')'
+                        let end = if bytes.get(i + 1) == Some(&b')') { i + 2 } else { i + 1 };
+                        return format!("{}{}{}", &config[..start], block, &config[end..]);
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+    format!("{}\n{}\n", config.trim_end(), block)
+}
 
 fn splice_block(config: &str, marker: &str, block: &str) -> String {
     if let Some(start) = config.find(marker) {

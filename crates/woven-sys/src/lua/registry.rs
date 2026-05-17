@@ -7,23 +7,13 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 use tracing::info;
-use woven_common::types::{AnimationConfig, BarConfig, DrawCmd, LayoutConfig, Theme, WidgetDef, WidgetSlot};
+use woven_common::types::{AnimationConfig, LayoutConfig, Theme};
 use crate::compositor::backend::WmEvent;
 
 use crate::compositor::backend::CompositorBackend;
 use crate::sys::proc_metrics::MetricsCollector;
 
 use woven_render::{RenderThread, RenderCmd};
-
-/// A registered bar widget + its Lua render function + last render time.
-pub struct WidgetEntry {
-    pub def:          WidgetDef,
-    pub render_key:   LuaRegistryKey,           // registered Lua function
-    pub cmds:         Arc<Mutex<Vec<DrawCmd>>>,  // shared with ctx closures
-    pub last_render:  std::time::Instant,
-    /// Last error string — tracked to avoid spamming notifications on every tick.
-    pub last_error:   Option<String>,
-}
 
 /// Shared app state passed into every Lua API function
 #[allow(dead_code)]
@@ -35,8 +25,7 @@ pub struct AppState {
     pub anims:       Arc<RwLock<AnimationConfig>>,
     pub runtime_dir: String,
     pub config_path: String,
-    pub widgets:     Arc<Mutex<Vec<WidgetEntry>>>,
-    /// Pending compositor events to fire on next woven.sleep() tick.
+/// Pending compositor events to fire on next woven.sleep() tick.
     pub event_queue: Arc<Mutex<VecDeque<WmEvent>>>,
     /// Registered Lua event hooks: event-name → list of callback keys.
     pub hooks:       Arc<Mutex<HashMap<String, Vec<LuaRegistryKey>>>>,
@@ -44,6 +33,8 @@ pub struct AppState {
     pub error_handler: Arc<Mutex<Option<LuaRegistryKey>>>,
     /// Cava audio reader — started on first call to `woven.audio.start()`.
     pub cava: Arc<Mutex<Option<crate::sys::audio::CavaReader>>>,
+    /// Shutdown flag for the embedded bar thread. Set to true to stop the bar.
+    pub bar_shutdown: Arc<Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>>,
     /// Persistent key-value store — survives hot-reloads and restarts.
     pub store: Arc<Mutex<HashMap<String, serde_json::Value>>>,
     /// Workspace auto-namer — replaces numeric IDs with smart names in the overlay.
@@ -384,14 +375,10 @@ fn bind_overlay(lua: &Lua, woven: &LuaTable, state: Arc<AppState>) -> LuaResult<
     woven.set("overlay", ov)?;
 
     // woven.sleep(ms) — blocks the Lua run loop for N milliseconds.
-    // Also ticks any registered bar widgets that are due for a re-render.
-    let widgets_sleep = state.widgets.clone();
-    let events_sleep  = state.event_queue.clone();
-    let hooks_sleep   = state.hooks.clone();
-    let render_sleep  = state.render.clone();
+    let events_sleep = state.event_queue.clone();
+    let hooks_sleep  = state.hooks.clone();
     let sleep_fn = lua.create_function(move |lua, ms: u64| {
         std::thread::sleep(std::time::Duration::from_millis(ms));
-        tick_widgets(lua, &widgets_sleep, &render_sleep);
         fire_events(lua, &events_sleep, &hooks_sleep);
         Ok(())
     })?;
@@ -514,14 +501,39 @@ fn bind_config_api(lua: &Lua, woven: &LuaTable, state: Arc<AppState>) -> LuaResu
 }
 
 fn bind_bar_api(lua: &Lua, woven: &LuaTable, state: Arc<AppState>) -> LuaResult<()> {
-    let render = state.render.clone();
-    // woven.bar({ enabled = true, position = "right" })
+    // woven.bar({ enabled, position, style, height, theme, bubbles, modules, ... })
+    // Parses config directly from Lua (no TOML intermediary) and (re)starts the bar thread.
     let set_bar = lua.create_function(move |_, t: LuaTable| {
-        let enabled  = t.get::<bool>("enabled").unwrap_or(true);
-        let position = t.get::<String>("position").unwrap_or_else(|_| "right".into());
-        let json = serde_json::json!({ "enabled": enabled, "position": position });
-        let cfg: BarConfig = serde_json::from_value(json).map_err(LuaError::external)?;
-        render.send(RenderCmd::UpdateBarConfig(cfg));
+        let enabled = t.get::<bool>("enabled").unwrap_or(true);
+
+        // Always shut down old bar thread first
+        if let Ok(mut guard) = state.bar_shutdown.lock() {
+            if let Some(old) = guard.take() {
+                old.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        if !enabled {
+            tracing::info!("woven bar disabled");
+            return Ok(());
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Lua table → JSON → BarConfig (serde handles all nested tables/arrays)
+        let json = lua_to_json(LuaValue::Table(t)).map_err(LuaError::external)?;
+        let cfg: woven_bar::BarConfig = serde_json::from_value(json).unwrap_or_default();
+
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if let Ok(mut guard) = state.bar_shutdown.lock() {
+            *guard = Some(flag.clone());
+        }
+        std::thread::spawn(move || {
+            if let Err(e) = woven_bar::run(cfg, flag) {
+                tracing::warn!("woven bar thread exited: {e}");
+            }
+        });
+        tracing::info!("woven bar thread started");
         Ok(())
     })?;
     woven.set("bar", set_bar)?;
@@ -556,7 +568,6 @@ fn bind_plugin_api(lua: &Lua, woven: &LuaTable, state: Arc<AppState>) -> LuaResu
     let plugin = lua.create_table()?;
 
     let render     = state.render.clone();
-    let widgets    = state.widgets.clone();
     let config_dir = std::path::Path::new(&state.config_path)
     .parent()
     .map(|p| p.to_string_lossy().to_string())
@@ -597,74 +608,7 @@ fn bind_plugin_api(lua: &Lua, woven: &LuaTable, state: Arc<AppState>) -> LuaResu
             handle.set("icon_default", icon_default_fn)?;
         }
 
-        // ── bar widget ───────────────────────────────────────────────────
-        if kind == "bar_widget" {
-            let render_w  = render.clone();
-            let widgets_w = widgets.clone();
-            let plugin_id = name.clone();
-
-            // handle.widget({ slot="bottom", height=40, interval=5, render=fn })
-            let widget_fn = lua.create_function(move |lua, cfg: LuaTable| {
-                let slot_str: String = cfg.get("slot").unwrap_or_else(|_| "bottom".into());
-                let slot = match slot_str.as_str() {
-                    "top"     => WidgetSlot::Top,
-                    "panel"   => WidgetSlot::Panel,
-                    "overlay" => WidgetSlot::Overlay,
-                    _         => WidgetSlot::Bottom,
-                };
-                let height:    u32 = cfg.get("height").unwrap_or(40);
-                let interval:  u32 = cfg.get("interval").unwrap_or(5);
-                let onclick: Option<String> = cfg.get("onclick").ok();
-                let render_fn: LuaFunction = cfg.get("render")
-                .map_err(|_| LuaError::external("bar_widget: render function required"))?;
-
-                // Canvas dimensions per slot:
-                //   Top/Bottom → BAR_THICK(52) - 2*pad(6) = 40
-                //   Panel      → PANEL_THICK(300) - 2*pad(14) = 272
-                //   Overlay    → max slot_w(260) - gap(8) = 252
-                let canvas_w: f32 = match slot {
-                    WidgetSlot::Top | WidgetSlot::Bottom => 40.0,
-                    WidgetSlot::Panel   => 272.0,
-                    WidgetSlot::Overlay => 252.0,
-                };
-
-                let def = WidgetDef {
-                    id:           plugin_id.clone(),
-                    slot,
-                    height,
-                    interval_secs: interval,
-                    onclick_cmd:   onclick,
-                };
-
-                // Shared draw-command buffer — written by ctx closures, read by tick_widgets.
-                let cmds: Arc<Mutex<Vec<DrawCmd>>> = Arc::new(Mutex::new(Vec::new()));
-                let ctx = build_ctx(lua, cmds.clone(), height as f32, canvas_w)?;
-
-                let render_key = lua.create_registry_value(render_fn)?;
-
-                // Register with the render thread.
-                render_w.send(RenderCmd::RegisterWidget(def.clone()));
-
-                // Store entry so tick_widgets can call it.
-                if let Ok(mut list) = widgets_w.lock() {
-                    list.retain(|e| e.def.id != plugin_id); // replace if re-registered
-                    list.push(WidgetEntry {
-                        def,
-                        render_key,
-                        cmds,
-                        last_render: std::time::Instant::now()
-                        .checked_sub(std::time::Duration::from_secs(999))
-                        .unwrap_or(std::time::Instant::now()),
-                        last_error: None,
-                    });
-                }
-
-                // Store ctx on the handle so Lua can inspect it if needed.
-                lua.globals().set(format!("__woven_ctx_{}", plugin_id), ctx)?;
-                Ok(())
-            })?;
-            handle.set("widget", widget_fn)?;
-        }
+        // bar_widget type removed — bar widgets are now native woven-bar modules
 
         Ok(handle)
     })?;
@@ -674,162 +618,6 @@ fn bind_plugin_api(lua: &Lua, woven: &LuaTable, state: Arc<AppState>) -> LuaResu
     Ok(())
 }
 
-/// Build a Lua ctx table whose methods append to `cmds`.
-/// `canvas_h` / `canvas_w` are the logical pixel dimensions of the widget canvas.
-fn build_ctx(lua: &Lua, cmds: Arc<Mutex<Vec<DrawCmd>>>, canvas_h: f32, canvas_w: f32) -> LuaResult<LuaTable> {
-    let ctx = lua.create_table()?;
-
-    let c = cmds.clone();
-    ctx.set("text", lua.create_function(move |_, (text, opts): (String, LuaTable)| {
-        let x     = opts.get::<f32>("x").unwrap_or(0.0);
-        let y     = opts.get::<f32>("y").unwrap_or(0.0);
-        let size  = opts.get::<f32>("size").unwrap_or(12.0);
-        let color = opts.get::<String>("color").unwrap_or_else(|_| "#cdd6f4".into());
-        let alpha = opts.get::<f32>("alpha").unwrap_or(1.0);
-        if let Ok(mut g) = c.lock() { g.push(DrawCmd::Text { content: text, x, y, size, color, alpha }); }
-        Ok(())
-    })?)?;
-
-    let c = cmds.clone();
-    ctx.set("rect", lua.create_function(move |_, (x, y, w, h, opts): (f32, f32, f32, f32, Option<LuaTable>)| {
-        let color  = opts.as_ref().and_then(|t| t.get::<String>("color").ok()).unwrap_or_else(|| "#313244".into());
-        let alpha  = opts.as_ref().and_then(|t| t.get::<f32>("alpha").ok()).unwrap_or(1.0);
-        let radius = opts.as_ref().and_then(|t| t.get::<f32>("radius").ok()).unwrap_or(4.0);
-        if let Ok(mut g) = c.lock() { g.push(DrawCmd::FillRect { x, y, w, h, color, alpha, radius }); }
-        Ok(())
-    })?)?;
-
-    let c = cmds.clone();
-    ctx.set("circle", lua.create_function(move |_, (cx, cy, r, opts): (f32, f32, f32, Option<LuaTable>)| {
-        let color = opts.as_ref().and_then(|t| t.get::<String>("color").ok()).unwrap_or_else(|| "#89b4fa".into());
-        let alpha = opts.as_ref().and_then(|t| t.get::<f32>("alpha").ok()).unwrap_or(1.0);
-        if let Ok(mut g) = c.lock() { g.push(DrawCmd::Circle { cx, cy, r, color, alpha }); }
-        Ok(())
-    })?)?;
-
-    let c = cmds.clone();
-    ctx.set("clear", lua.create_function(move |_, opts: Option<LuaTable>| {
-        let color = opts.as_ref().and_then(|t| t.get::<String>("color").ok())
-        .unwrap_or_else(|| "#1e1e2e".into());
-        let alpha = opts.as_ref().and_then(|t| t.get::<f32>("alpha").ok()).unwrap_or(0.85);
-        if let Ok(mut g) = c.lock() { g.push(DrawCmd::Clear { color, alpha }); }
-        Ok(())
-    })?)?;
-
-    let c = cmds.clone();
-    ctx.set("text_centered", lua.create_function(move |_, (text, opts): (String, LuaTable)| {
-        let y     = opts.get::<f32>("y").unwrap_or(0.0);
-        let size  = opts.get::<f32>("size").unwrap_or(12.0);
-        let color = opts.get::<String>("color").unwrap_or_else(|_| "#cdd6f4".into());
-        let alpha = opts.get::<f32>("alpha").unwrap_or(1.0);
-        if let Ok(mut g) = c.lock() { g.push(DrawCmd::TextCentered { content: text, y, size, color, alpha }); }
-        Ok(())
-    })?)?;
-
-    let c = cmds.clone();
-    ctx.set("app_icon", lua.create_function(move |_, (class, opts): (String, LuaTable)| {
-        let x    = opts.get::<f32>("x").unwrap_or(-1.0); // -1 = auto-center
-        let y    = opts.get::<f32>("y").unwrap_or(5.0);
-        let size = opts.get::<f32>("size").unwrap_or(40.0);
-        if let Ok(mut g) = c.lock() { g.push(DrawCmd::AppIcon { class, x, y, size }); }
-        Ok(())
-    })?)?;
-
-    ctx.set("height", canvas_h)?;
-    ctx.set("w",      canvas_w)?;
-    ctx.set("h",      canvas_h)?; // alias so both ctx.h and ctx.height work
-    Ok(ctx)
-}
-
-/// Called by `woven.sleep()` — re-renders any widget whose interval has elapsed.
-fn tick_widgets(lua: &Lua, widgets: &Arc<Mutex<Vec<WidgetEntry>>>, render: &Arc<RenderThread>) {
-    // Collect due widgets under lock, then drop lock before calling Lua.
-    // This prevents deadlocks if a render function calls back into the widget API.
-    struct DueWidget {
-        idx:       usize,
-        id:        String,
-        cmds:      Arc<Mutex<Vec<DrawCmd>>>,
-    }
-
-    let due_list: Vec<DueWidget> = {
-        let Ok(list) = widgets.lock() else { return };
-        list.iter().enumerate().filter_map(|(i, entry)| {
-            let due = entry.def.interval_secs == 0
-                || entry.last_render.elapsed().as_secs() >= entry.def.interval_secs as u64;
-            if !due { return None; }
-            Some(DueWidget {
-                idx: i,
-                id:  entry.def.id.clone(),
-                cmds: entry.cmds.clone(),
-            })
-        }).collect()
-    };
-    // Lock is dropped here.
-
-    for dw in &due_list {
-        // Retrieve the render function from the Lua registry.
-        let render_key = {
-            let Ok(list) = widgets.lock() else { continue };
-            let Some(entry) = list.get(dw.idx) else { continue };
-            if entry.def.id != dw.id { continue; } // guard against index shift
-            lua.registry_value::<LuaFunction>(&entry.render_key).ok()
-        };
-        let Some(func) = render_key else { continue };
-
-        let ctx_key = format!("__woven_ctx_{}", dw.id);
-        let Ok(ctx) = lua.globals().get::<LuaTable>(ctx_key) else { continue };
-
-        // Clear previous draw commands.
-        if let Ok(mut g) = dw.cmds.lock() { g.clear(); }
-
-        // Call render(ctx) — lock is NOT held, so callbacks are safe.
-        if let Err(e) = func.call::<()>(ctx) {
-            let msg = e.to_string();
-            tracing::warn!("[plugin {}] render error: {}", dw.id, msg);
-            // Update last_error under lock, only notify on new/changed errors.
-            let should_notify = {
-                let Ok(mut list) = widgets.lock() else { continue };
-                if let Some(entry) = list.get_mut(dw.idx).filter(|e| e.def.id == dw.id) {
-                    let changed = entry.last_error.as_deref() != Some(&msg);
-                    entry.last_error = Some(msg.clone());
-                    changed
-                } else { false }
-            };
-            if should_notify {
-                let title = format!("woven plugin: {}", dw.id);
-                let _ = std::process::Command::new("notify-send")
-                    .args(["-u", "normal", "-i", "dialog-warning", &title, &msg])
-                    .spawn();
-                render.send(RenderCmd::ShowToast {
-                    message:     format!("[{}] {}", dw.id, msg),
-                    duration_ms: 6000,
-                });
-            }
-        } else {
-            // Clear error on success.
-            if let Ok(mut list) = widgets.lock() {
-                if let Some(entry) = list.get_mut(dw.idx).filter(|e| e.def.id == dw.id) {
-                    entry.last_error = None;
-                }
-            }
-        }
-
-        // Collect commands and send to render thread.
-        if let Ok(g) = dw.cmds.lock() {
-            render.send(RenderCmd::UpdateWidgetContent {
-                id:   dw.id.clone(),
-                cmds: g.clone(),
-            });
-        }
-
-        // Update last_render timestamp.
-        if let Ok(mut list) = widgets.lock() {
-            if let Some(entry) = list.get_mut(dw.idx).filter(|e| e.def.id == dw.id) {
-                entry.last_render = std::time::Instant::now();
-            }
-        }
-    }
-}
 
 /// `woven.on("workspace_focus", function(data) ... end)`
 /// Registers a Lua callback for a compositor event.

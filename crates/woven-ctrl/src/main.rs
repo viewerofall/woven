@@ -6,7 +6,7 @@
 mod setup;
 mod helpers;
 mod compositor_config;
-use helpers::*;
+use helpers::{*, BAR_POSITIONS, BAR_STYLES};
 use compositor_config::{CompositorStatus, detect_all, inject_keybind, inject_autostart, reload_compositor};
 use woven_common::ipc::{IpcCommand, IpcResponse};
 
@@ -42,6 +42,7 @@ enum Msg {
     // Bar tab
     BarEnabledToggle(bool),
     BarPositionPicked(String),
+    BarStylePicked(String),
     BarApply,
 
     // Theme tab
@@ -119,6 +120,7 @@ struct App {
     // bar
     bar_enabled:     bool,
     bar_position:    String,
+    bar_style:       String,
     // theme
     preset:          String,
     col_bg:          String,
@@ -164,6 +166,7 @@ impl Default for App {
             comp_statuses:   detect_all(),
             bar_enabled:     bar.enabled,
             bar_position:    bar.position,
+            bar_style:       bar.style,
             preset:          theme.preset,
             col_bg:          theme.background,
             col_accent:      theme.accent,
@@ -261,10 +264,11 @@ fn update(s: &mut App, msg: Msg) -> Task<Msg> {
         }
 
         // ── Bar ───────────────────────────────────────────────────────────────
-        Msg::BarEnabledToggle(v) => s.bar_enabled  = v,
+        Msg::BarEnabledToggle(v)  => s.bar_enabled  = v,
         Msg::BarPositionPicked(v) => s.bar_position = v,
+        Msg::BarStylePicked(v)    => s.bar_style    = v,
         Msg::BarApply => {
-            let block  = build_bar_block(s.bar_enabled, &s.bar_position);
+            let block  = build_bar_block(s.bar_enabled, &s.bar_position, &s.bar_style);
             let config = splice_bar_into_config(&read_config(), &block);
             if let Err(e) = validate_lua_syntax(&config) {
                 s.status = format!("Lua error — not saved: {e}");
@@ -690,10 +694,11 @@ fn view_status(s: &App) -> Element<'_, Msg> {
 
 fn view_bar(s: &App) -> Element<'_, Msg> {
     let pos_diagram = bar_position_diagram(&s.bar_position);
+    let dim = Color::from_rgb(0.5, 0.5, 0.5);
 
     scrollable(column![
         text("Bar settings").size(22),
-        text("The persistent docked bar. Expand it to open the full control center.").size(11),
+        text("Saves to woven.lua and reloads the daemon.").size(11),
 
         rule::horizontal(1),
         checkbox(s.bar_enabled).label("Enabled").on_toggle(Msg::BarEnabledToggle),
@@ -707,13 +712,20 @@ fn view_bar(s: &App) -> Element<'_, Msg> {
         ].spacing(24).align_y(Alignment::Center),
 
         rule::horizontal(1),
-        text("What you get").size(15),
-        text("Collapsed (52px):  clock, active workspace dots, CPU%, expand button").size(12),
-        text("Expanded (300px):  clock + weather, media controls, WiFi/BT tiles,").size(12),
-        text("                   CPU/GPU temps, RAM, volume, power menu").size(12),
-        text("Requires:  playerctl  nmcli  bluetoothctl  curl").size(11),
+        text("Style").size(15),
+        pick_list(BAR_STYLES, Some(s.bar_style.as_str()),
+            |p: &str| Msg::BarStylePicked(p.to_string())).width(140),
+        text("bubbles — rounded pill segments per group  |  solid — full-width bar").size(11).color(dim),
 
         rule::horizontal(1),
+        text("Modules").size(15),
+        text("Edit modules directly in the Config tab (left / center / right arrays).").size(11).color(dim),
+        text("Default: left=[activities, workspaces]  center=[window_title]").size(11).color(dim),
+        text("         right=[cava, |, network, audio, battery, |, clock, date]").size(11).color(dim),
+
+        rule::horizontal(1),
+        text("Note: Apply overwrites your woven.bar({}) block with the above settings.").size(10).color(dim),
+        text("Advanced options (theme, bubbles, weather) are preserved only if set here.").size(10).color(dim),
         button("Apply & Save").on_press(Msg::BarApply).padding([6u16, 18u16]),
     ].spacing(14).padding([32u16, 32u16])).into()
 }

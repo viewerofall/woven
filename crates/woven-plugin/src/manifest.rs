@@ -8,8 +8,6 @@ use serde::{Deserialize, Serialize};
 pub enum PluginType {
     /// Provides app-class → image-file mappings.
     IconPack,
-    /// Adds a widget to the persistent bar (left / center / right slot).
-    BarWidget,
     /// Adds a panel section to the overlay.
     OverlayPanel,
     /// Provides a complete theme (color values).
