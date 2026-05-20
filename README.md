@@ -43,7 +43,7 @@ GNOME is not supported (no `wlr-layer-shell`). KDE support is planned.
 ### One-liner
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/viewerofall/woven/main/get.sh | sh
+curl -fsSL https://viewerofall.pages.dev/install/woven/install.sh | sh
 ```
 
 ### From source
