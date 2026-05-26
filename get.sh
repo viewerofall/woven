@@ -5,7 +5,7 @@
 set -e
 
 REPO="viewerofall/woven"
-TARBALL="v2.2.3.tar.gz"
+TARBALL="v2.5.0.tar.gz"
 TMP=$(mktemp -d)
 
 cleanup() { rm -rf "$TMP"; }
@@ -86,7 +86,7 @@ echo "    Launch 'Woven Control Panel' from your app launcher"
 echo "    or run: woven-ctrl"
 echo ""
 echo "    Add your compositor keybind:"
-echo "    Hyprland: bind = SUPER, grave, exec, woven-ctrl --toggle"
+echo "    Hyprland: hl.bind(\"SUPER + grave\", hl.dsp.exec_cmd(\"woven-ctrl --toggle\"))"
 echo "    Niri:     Super+Grave { spawn \"woven-ctrl\" \"--toggle\"; }"
 echo "    Sway:     bindsym Super+grave exec woven-ctrl --toggle"
 echo ""
