@@ -26,10 +26,10 @@ pub const COMPOSITORS: &[CompositorDef] = &[
     CompositorDef {
         name:        "Hyprland",
         binary:      "hyprctl",
-        config_rel:  ".config/hypr/hyprland.conf",
+        config_rel:  ".config/hypr/hyprland.lua",
         session_env: "HYPRLAND_INSTANCE_SIGNATURE",
-        keybind_snippet:   "\n# woven — workspace overlay toggle\nbind = SUPER, grave, exec, woven-ctrl --toggle\n",
-        autostart_snippet: "\n# woven — start overlay daemon\nexec-once = woven\n",
+        keybind_snippet:   "\n-- woven — workspace overlay toggle\nhl.bind(\"SUPER + grave\", hl.dsp.exec_cmd(\"woven-ctrl --toggle\"))\n",
+        autostart_snippet: "\n-- woven — start overlay daemon\nhl.on(\"hyprland.start\", function()\n    hl.exec_cmd(\"woven\")\nend)\n",
     },
     CompositorDef {
         name:        "Niri",
@@ -112,7 +112,8 @@ fn scan_config(path: &str) -> (bool, bool) {
         let is_exec = l.starts_with("exec")
             || l.starts_with("spawn")
             || l.starts_with("riverctl spawn")
-            || l.starts_with("spawn-at-startup");
+            || l.starts_with("spawn-at-startup")
+            || l.starts_with("hl.exec_cmd"); // Hyprland Lua API
         is_exec && l.contains("woven") && !l.contains("woven-ctrl")
     });
     (keybind, autostart)
@@ -178,7 +179,7 @@ pub fn inject_autostart(status: &CompositorStatus) -> Result<(), String> {
     if current.lines().any(|l| {
         let l = l.trim();
         (l.starts_with("exec") || l.starts_with("spawn") || l.starts_with("riverctl spawn")
-            || l.starts_with("spawn-at-startup"))
+            || l.starts_with("spawn-at-startup") || l.starts_with("hl.exec_cmd"))
             && l.contains("woven") && !l.contains("woven-ctrl")
     }) {
         return Err("Autostart already present — nothing to do.".into());

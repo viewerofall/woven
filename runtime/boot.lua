@@ -75,4 +75,37 @@ woven.settings(_buffered_settings)
 woven.workspaces(_buffered_ws)
 woven.animations(_buffered_anim)
 
+-- ── Load compositor-specific module ──────────────────────────────────────────
+local compositor = require("compositor.detect")
+woven.compositor_name = compositor.name
+woven.is_compositor   = compositor.is
+
+if compositor.name == "hyprland" then
+    local ok, mod = pcall(require, "compositor.hyprland")
+    if ok then
+        woven.hypr = mod
+        log.info("compositor: hyprland module loaded → woven.hypr.*")
+    else
+        log.warn("compositor: failed to load hyprland module: " .. tostring(mod))
+    end
+elseif compositor.name == "niri" then
+    local ok, mod = pcall(require, "compositor.niri")
+    if ok then
+        woven.niri = mod
+        log.info("compositor: niri module loaded → woven.niri.*")
+    else
+        log.warn("compositor: failed to load niri module: " .. tostring(mod))
+    end
+elseif compositor.name == "sway" then
+    local ok, mod = pcall(require, "compositor.sway")
+    if ok then
+        woven.sway = mod
+        log.info("compositor: sway module loaded → woven.sway.*")
+    else
+        log.warn("compositor: failed to load sway module: " .. tostring(mod))
+    end
+else
+    log.info("compositor: " .. compositor.name .. " (no runtime module)")
+end
+
 log.info("boot: complete")
