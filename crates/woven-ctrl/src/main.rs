@@ -1227,15 +1227,16 @@ fn build_plugin_views(s: &App) -> Vec<PluginView> {
 }
 
 /// Add a require line for a plugin to woven.lua.
+/// Wrapped in pcall so a broken plugin doesn't cascade to other plugins.
 fn enable_plugin_in_config(name: &str) {
     let config = read_config();
     // Don't add if already present
-    if config.contains(&format!("require(\"plugins.{}\")", name))
-        || config.contains(&format!("require('plugins.{}')", name))
+    if config.contains(&format!("pcall(function() require(\"plugins.{}\")", name))
+        || config.contains(&format!("pcall(function() require('plugins.{}')", name))
     {
         return;
     }
-    let require_line = format!("require(\"plugins.{}\").setup()", name);
+    let require_line = format!("pcall(function() require(\"plugins.{}\").setup() end)", name);
     let new_config = format!("{}\n{}\n", config.trim_end(), require_line);
     let _ = write_config(&new_config);
 }
@@ -1243,8 +1244,7 @@ fn enable_plugin_in_config(name: &str) {
 /// Remove the require line for a plugin from woven.lua.
 fn disable_plugin_in_config(name: &str) {
     let config = read_config();
-    // Match exact require patterns to avoid clobbering similar names
-    // (e.g. "date" must not match "date_extended") or removing comments.
+    // Match patterns with pcall wrapper to avoid clobbering similar names
     let pat_dq = format!("require(\"plugins.{}\")", name);
     let pat_sq = format!("require('plugins.{}')", name);
     let new_config: String = config.lines()
@@ -1598,23 +1598,48 @@ fn self_update() {
 // ── main ──────────────────────────────────────────────────────────────────────
 
 fn main() -> iced::Result {
-    for arg in std::env::args().skip(1) {
+    let args: Vec<String> = std::env::args().collect();
+
+    // Check for help first
+    if args.len() > 1 && (args[1] == "-h" || args[1] == "--help" || args[1] == "help") {
+        println!("woven-ctrl — control panel and CLI for woven");
+        println!();
+        println!("USAGE:");
+        println!("  woven-ctrl              Open GUI control panel");
+        println!();
+        println!("CLI COMMANDS:");
+        println!("  --show                  Show overlay");
+        println!("  --hide                  Hide overlay");
+        println!("  --toggle                Toggle overlay (use for keybinds)");
+        println!("  --reload                Reload Lua config (plugins, bar, themes, animations)");
+        println!("  --restart               Full daemon restart (resets all state)");
+        println!("  --setup                 First-time setup wizard");
+        println!("  --update                Check and install updates");
+        println!("  -h, --help              Show this help");
+        return Ok(());
+    }
+
+    for arg in args.iter().skip(1) {
         match arg.as_str() {
             "--show"   => { send_ipc(IpcCommand::Show);         return Ok(()); }
             "--hide"   => { send_ipc(IpcCommand::Hide);         return Ok(()); }
             "--toggle" => { send_ipc(IpcCommand::Toggle);       return Ok(()); }
             "--reload" => {
-                // Full reload: restart the daemon so all config (theme, plugins,
-                // bar, namer, widgets, animations) is re-evaluated from scratch.
-                // A partial in-process hot-reload only covered theme — this is
-                // the only way to pick up plugin/widget/namer changes.
+                // Reload Lua config: plugins, bar, namer, widgets, animations.
+                // Triggers daemon to reload woven.lua (Lua VM reload, can be fast later).
+                send_ipc(IpcCommand::ReloadConfig);
+                eprintln!("woven reloaded.");
+                return Ok(());
+            }
+            "--restart" => {
+                // Full daemon restart: resets all state including compositor tracking.
                 let status = std::process::Command::new("systemctl")
                     .args(["--user", "restart", "woven"])
                     .status();
                 match status {
-                    Ok(s) if s.success() => eprintln!("woven reloaded."),
-                    Ok(s)  => eprintln!("reload failed (exit {})", s),
-                    Err(e) => eprintln!("reload failed: {}", e),
+                    Ok(s) if s.success() => eprintln!("woven restarted."),
+                    Ok(s)  => eprintln!("restart failed (exit {})", s),
+                    Err(e) => eprintln!("restart failed: {}", e),
                 }
                 return Ok(());
             }

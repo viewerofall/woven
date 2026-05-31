@@ -169,6 +169,7 @@ async fn main() -> Result<()> {
         bar_shutdown:  Arc::new(std::sync::Mutex::new(None)),
         store:         Arc::new(std::sync::Mutex::new(load_store())),
         namer:         Arc::new(std::sync::Mutex::new(lua::ws_namer::WorkspaceNamer::default())),
+        last_error_hash: Arc::new(std::sync::Mutex::new(None)),
     });
 
     // ── periodic store flush (every 30s) ─────────────────────────────────────
@@ -312,6 +313,10 @@ async fn main() -> Result<()> {
                 async move {
                     match cmd {
                         IpcCommand::Show   => {
+                            // Unlock error notification when showing overlay
+                            if let Ok(mut last_hash) = state.last_error_hash.lock() {
+                                *last_hash = None;
+                            }
                             render.send(RenderCmd::Show);
                             IpcResponse::Ok
                         }
@@ -320,6 +325,10 @@ async fn main() -> Result<()> {
                             IpcResponse::Ok
                         }
                         IpcCommand::Toggle => {
+                            // Unlock error notification on toggle (could be showing)
+                            if let Ok(mut last_hash) = state.last_error_hash.lock() {
+                                *last_hash = None;
+                            }
                             render.send(RenderCmd::Toggle);
                             IpcResponse::Ok
                         }
@@ -340,6 +349,10 @@ async fn main() -> Result<()> {
                             IpcResponse::Ok
                         }
                         IpcCommand::GetStatus => {
+                            // Unlock error notification when user opens woven-ctrl
+                            if let Ok(mut last_hash) = state.last_error_hash.lock() {
+                                *last_hash = None;
+                            }
                             let theme  = state.theme.read().await.clone();
                             let backend_name = state.backend.name().to_string();
                             let workspaces = state.backend.workspaces().await

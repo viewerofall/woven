@@ -39,6 +39,8 @@ pub struct AppState {
     pub store: Arc<Mutex<HashMap<String, serde_json::Value>>>,
     /// Workspace auto-namer — replaces numeric IDs with smart names in the overlay.
     pub namer: Arc<Mutex<super::ws_namer::WorkspaceNamer>>,
+    /// Hash of last notified error — deduplicates notifications on repeated errors.
+    pub last_error_hash: Arc<Mutex<Option<u64>>>,
 }
 
 /// Serialize a serde-able value into a LuaValue via JSON round-trip.
@@ -964,11 +966,37 @@ fn bind_error_api(lua: &Lua, woven: &LuaTable, state: Arc<AppState>) -> LuaResul
     woven.set("on_error", on_error)?;
 
     // woven.__fire_error(msg) — called by boot.lua pcall catch block
+    // Deduplicates notifications: only fires if error hash is new
     let handler2 = state.error_handler.clone();
     let render   = state.render.clone();
+    let error_hash_state = state.last_error_hash.clone();
     let fire = lua.create_function(move |lua, msg: String| {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
         tracing::error!("[lua config] {}", msg);
-        // system notification — always fires regardless of user handler
+
+        // Check if this is a new error (hash hasn't been notified yet)
+        let mut hasher = DefaultHasher::new();
+        msg.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        let should_notify = if let Ok(mut last_hash) = error_hash_state.lock() {
+            if Some(hash) != *last_hash {
+                *last_hash = Some(hash);
+                true
+            } else {
+                false
+            }
+        } else {
+            true
+        };
+
+        if !should_notify {
+            return Ok(());
+        }
+
+        // system notification — fires only for new errors
         let _ = std::process::Command::new("notify-send")
             .args(["-u", "critical", "-i", "dialog-error", "woven: config error", &msg])
             .spawn();
