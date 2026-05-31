@@ -5,7 +5,7 @@
 set -e
 
 REPO="viewerofall/woven"
-TARBALL="v2.5.0.tar.gz"
+TARBALL="v2.5.3.tar.gz"
 TMP=$(mktemp -d)
 
 cleanup() { rm -rf "$TMP"; }
