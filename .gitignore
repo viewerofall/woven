@@ -13,7 +13,7 @@ PKGBUILD
 
 # useless stuff
 *.lock
-src/
+/src/
 pkg/
 
 # IDE
