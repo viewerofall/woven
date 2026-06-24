@@ -13,8 +13,8 @@ PKGBUILD
 
 # useless stuff
 *.lock
-src/
-pkg/
+/src/
+/pkg/
 
 # IDE
 .vscode/
