@@ -1,0 +1,38 @@
+[package]
+name    = "woven-lite"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight standalone Wayland dashboard — no daemon, spawns on keybind"
+
+[[bin]]
+name = "woven-lite"
+path = "src/main.rs"
+
+[build-dependencies]
+# build.rs only uses println! — no external deps needed
+
+[dependencies]
+woven-common    = { path = "../woven-common" }
+woven-protocols = { path = "../woven-protocols" }
+woven-render    = { path = "../woven-render" }
+
+tokio             = { workspace = true }
+anyhow            = { workspace = true }
+crossbeam-channel = { workspace = true }
+serde             = { workspace = true }
+serde_json        = { workspace = true }
+tracing           = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+tiny-skia  = { workspace = true }
+fontdue    = { workspace = true }
+chrono     = { workspace = true }
+
+smithay-client-toolkit = { workspace = true }
+wayland-client         = { workspace = true }
+wayland-protocols      = { workspace = true }
+wayland-protocols-wlr  = { workspace = true }
+rustix                 = { workspace = true }
+
+# Weather HTTP — sync + minimal, already in workspace
+ureq = { workspace = true }
