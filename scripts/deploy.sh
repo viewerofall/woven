@@ -4,7 +4,7 @@
 
 set -e
 
-VERSION="${1:-2.5.3}"
+VERSION="${1:-2.6}"
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="$PROJECT_ROOT/target/release"
 DIST_DIR="$PROJECT_ROOT/dist"
