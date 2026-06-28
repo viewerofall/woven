@@ -19,9 +19,10 @@ echo "==> Packaging release..."
 mkdir -p "$DIST_DIR"
 rm -f "$DIST_DIR/$TARBALL_NAME"
 
-# Create release structure
-RELEASE_DIR="$(mktemp -d)"
-trap "rm -rf $RELEASE_DIR" EXIT
+# Create release structure with predictable name for PKGBUILD compatibility
+WORK_DIR="$(mktemp -d)"
+RELEASE_DIR="$WORK_DIR/woven-v${VERSION}"
+trap "rm -rf $WORK_DIR" EXIT
 
 mkdir -p "$RELEASE_DIR/exec" "$RELEASE_DIR/runtime" "$RELEASE_DIR/plugins"
 
@@ -39,7 +40,7 @@ cp "$PROJECT_ROOT"/*.desktop "$RELEASE_DIR/" 2>/dev/null || true
 cp "$PROJECT_ROOT"/*_icon.png "$RELEASE_DIR/" 2>/dev/null || true
 
 # Create tarball
-tar -czf "$DIST_DIR/$TARBALL_NAME" -C "$(dirname "$RELEASE_DIR")" "$(basename "$RELEASE_DIR")"
+tar -czf "$DIST_DIR/$TARBALL_NAME" -C "$WORK_DIR" "woven-v${VERSION}"
 
 echo "✓ Built: $DIST_DIR/$TARBALL_NAME"
 ls -lh "$DIST_DIR/$TARBALL_NAME"
