@@ -26,15 +26,37 @@ pub struct SwayBackend {
 }
 
 impl SwayBackend {
+    fn find_socket() -> Option<String> {
+        // Try env var first
+        if let Ok(path) = env::var("SWAYSOCK") {
+            return Some(path);
+        }
+
+        // Search for socket in standard location (XDG_RUNTIME_DIR)
+        if let Ok(runtime_dir) = env::var("XDG_RUNTIME_DIR") {
+            if let Ok(entries) = std::fs::read_dir(&runtime_dir) {
+                for entry in entries.flatten() {
+                    if let Ok(name) = entry.file_name().into_string() {
+                        if name.starts_with("sway-ipc") {
+                            if let Ok(path) = entry.path().into_os_string().into_string() {
+                                return Some(path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     pub fn new() -> Result<Self> {
-        let path = env::var("SWAYSOCK")
-        .context("SWAYSOCK not set — is Sway running?")?;
+        let path = Self::find_socket()
+            .context("SWAYSOCK not set and no sway-ipc socket found — is Sway running?")?;
         Ok(Self { socket_path: path })
     }
 
     pub fn detect() -> bool {
-        env::var("SWAYSOCK").is_ok()
-        && env::var("HYPRLAND_INSTANCE_SIGNATURE").is_err() // don't steal from Hyprland
+        Self::find_socket().is_some()
     }
 
     async fn connect(&self) -> Result<UnixStream> {

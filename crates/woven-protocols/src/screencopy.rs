@@ -1,4 +1,4 @@
-//! Client-side wlr-screencopy-unstable-v1 state machine.
+//! Client-side wlr-screencopy-unstable-v1 state machine (Niri).
 //!
 //! Protocol flow per frame:
 //!   1. `zwlr_screencopy_manager_v1.capture_output_region(output, x, y, w, h)`
@@ -16,12 +16,10 @@
 //! this event."  We skip `buffer_done` gating and go immediately on the first
 //! Xrgb8888 SHM format event — also spec-compliant.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, os::fd::AsFd};
 
-use std::os::fd::AsFd;
-
-use crossbeam_channel::Sender;
-use tracing::{error, warn};
+use crossbeam_channel::{Receiver, Sender};
+use tracing::{error, info, warn};
 use wayland_client::{
   Connection, Dispatch, Proxy, QueueHandle, WEnum,
   protocol::{
@@ -37,8 +35,10 @@ use wayland_protocols_wlr::screencopy::v1::client::{
   zwlr_screencopy_frame_v1::{self, ZwlrScreencopyFrameV1},
   zwlr_screencopy_manager_v1::{self, ZwlrScreencopyManagerV1},
 };
+use rustix::time::Timespec;
+use rustix::event::{PollFd, PollFlags};
 
-use crate::{shm::ShmAlloc, CaptureRequest, ThumbnailFrame};
+use crate::{shm::ShmAlloc, CaptureRequest, ThumbnailFrame, TryRecvError};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Per-frame allocation state (keyed by ZwlrScreencopyFrameV1::id())
@@ -52,6 +52,7 @@ pub(crate) struct PendingFrame {
   pub width:     u32,
   pub height:    u32,
   pub stride:    u32,
+  pub format:    wl_shm::Format,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -69,7 +70,7 @@ pub(crate) struct ScreencopyState {
   pub output_scales:      Vec<i32>,
   pub live_frames:        Vec<ZwlrScreencopyFrameV1>,
   pub pending_frames:     HashMap<ObjectId, PendingFrame>,
-  pub frame_tx:           Sender<ThumbnailFrame>,
+  pub frame_tx:           crossbeam_channel::Sender<ThumbnailFrame>,
 }
 
 impl ScreencopyState {
@@ -116,6 +117,81 @@ impl ScreencopyState {
     };
     self.live_frames.push(frame);
   }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Public entry point
+// ──────────────────────────────────────────────────────────────────────────────
+
+pub fn run_zwlr(
+    request_rx: Receiver<CaptureRequest>,
+    frame_tx:   Sender<ThumbnailFrame>,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let conn    = Connection::connect_to_env().context("wayland connect")?;
+    let display = conn.display();
+    let mut queue = conn.new_event_queue::<ScreencopyState>();
+    let qh = queue.handle();
+
+    let mut state = ScreencopyState::new(frame_tx);
+
+    // Trigger global enumeration.
+    let _registry = display.get_registry(&qh, ());
+    queue.roundtrip(&mut state).context("initial roundtrip")?;
+
+    if state.shm.is_none() {
+        anyhow::bail!("compositor did not advertise wl_shm");
+    }
+    if state.screencopy_manager.is_none() {
+        anyhow::bail!(
+            "compositor did not advertise zwlr_screencopy_manager_v1; \
+is the compositor running?"
+        );
+    }
+    if state.outputs.is_empty() {
+        anyhow::bail!("no wl_output found on screencopy connection");
+    }
+
+    info!(
+        "zwlr screencopy thread ready ({} output(s), scales: {:?})",
+        state.outputs.len(),
+        state.output_scales
+    );
+
+    let conn_fd = conn.as_fd();
+
+    loop {
+        // ── 1. Accept incoming capture requests ───────────────────────────
+        loop {
+            match request_rx.try_recv() {
+                Ok(req)                       => state.issue_capture(&req, &qh),
+                Err(TryRecvError::Empty)      => break,
+                Err(TryRecvError::Disconnected) => {
+                    info!("screencopy request channel closed — exiting thread");
+                    return Ok(());
+                }
+            }
+        }
+
+        // ── 2. Flush pending outgoing Wayland requests ─────────────────────
+        queue.flush().context("queue flush")?;
+
+        // ── 3. Dispatch already-buffered events (non-blocking) ─────────────
+        queue.dispatch_pending(&mut state).context("dispatch_pending")?;
+
+        // ── 4. Poll + read from socket ─────────────────────────────────────
+        let timeout_ms: i64 = if state.pending_frames.is_empty() { 50 } else { 5 };
+        let ts = Timespec { tv_sec: 0, tv_nsec: timeout_ms * 1_000_000 };
+        let mut poll_fds = [PollFd::new(&conn_fd, PollFlags::IN)];
+        let _ = rustix::event::poll(&mut poll_fds, Some(&ts));
+
+        if let Some(guard) = queue.prepare_read() {
+            guard.read().ok();
+        }
+
+        queue.dispatch_pending(&mut state).context("dispatch_pending post-read")?;
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -221,44 +297,54 @@ impl Dispatch<ZwlrScreencopyFrameV1, u64> for ScreencopyState {
     match event {
       // ── buffer: compositor tells us what size/format SHM to prepare ───
       Event::Buffer { format, width, height, stride } => {
-        // Only handle XRGB8888 SHM.  If we've already allocated for
-        // this frame (v2+ sends multiple buffer events), skip.
-        if format != WEnum::Value(wl_shm::Format::Xrgb8888) {
+        // Accept XRGB8888 (Niri), XBGR8888 (Sway), ARGB8888 (Hyprland).
+        // If we've already allocated for this frame (v2+ sends multiple buffer events), skip.
+        let is_supported = format == WEnum::Value(wl_shm::Format::Xrgb8888)
+          || format == WEnum::Value(wl_shm::Format::Xbgr8888)
+          || format == WEnum::Value(wl_shm::Format::Argb8888);
+        if !is_supported {
+          warn!("screencopy: unsupported format {:?}", format);
           return;
         }
         if state.pending_frames.contains_key(&frame.id()) {
           return;
         }
-        
+
         let Some(shm) = &state.shm else {
           error!("wl_shm not bound when buffer event arrived");
           return;
         };
-        
+
         let len = (stride * height) as usize;
         let alloc = match ShmAlloc::new(len) {
           Ok(a)  => a,
           Err(e) => { error!("ShmAlloc failed: {e:#}"); return; }
         };
-        
+
         // wl_shm_pool → wl_buffer
         let pool   = shm.create_pool(alloc.fd.as_fd(), len as i32, qh, ());
+        let fmt = match format {
+          WEnum::Value(wl_shm::Format::Xbgr8888) => wl_shm::Format::Xbgr8888,
+          WEnum::Value(wl_shm::Format::Argb8888) => wl_shm::Format::Argb8888,
+          _ => wl_shm::Format::Xrgb8888,
+        };
         let wl_buf = pool.create_buffer(
           0,
           width as i32, height as i32, stride as i32,
-          wl_shm::Format::Xrgb8888,
+          fmt,
           qh, (),
         );
-        
+
         // Issue copy — safe to call inside event handler.
         frame.copy(&wl_buf);
-        
+
         state.pending_frames.insert(frame.id(), PendingFrame {
           window_id: *window_id,
           alloc,
           pool,
           wl_buf,
           width, height, stride,
+          format: fmt,
         });
       }
       
@@ -266,8 +352,18 @@ impl Dispatch<ZwlrScreencopyFrameV1, u64> for ScreencopyState {
       Event::Ready { .. } => {
         // Remove live frame proxy → sends `destroy` to compositor.
         state.live_frames.retain(|f| f.id() != frame.id());
-        
-        if let Some(pf) = state.pending_frames.remove(&frame.id()) {
+
+        if let Some(mut pf) = state.pending_frames.remove(&frame.id()) {
+          // Format conversions:
+          // - XBGR8888 (Sway): swap bytes 0 and 2 (B and R)
+          // - ARGB8888 (Hyprland): no conversion needed (A in byte 0, RGB in 1-3, same as XRGB layout)
+          if pf.format == wl_shm::Format::Xbgr8888 {
+            let buf = pf.alloc.data_mut();
+            for pixel in buf.chunks_exact_mut(4) {
+              pixel.swap(0, 2); // Swap B and R
+            }
+          }
+
           let data: Arc<[u8]> = pf.alloc.data().into();
           let _ = state.frame_tx.try_send(ThumbnailFrame {
             window_id: pf.window_id,

@@ -135,15 +135,6 @@ fn render_loop(
             match cmd {
                 RenderCmd::Show => {
                     if !visible {
-                        // Capture before anim starts so surface is still transparent.
-                        if let Some(ref mut tc) = thumbnailer {
-                            tc.request_output(0);
-                            // Also tag the capture as the active workspace's screenshot.
-                            if let Some(ws_id) = painter.active_workspace_id() {
-                                tc.request_output_for_ws(ws_id, 0);
-                            }
-                            tc.request_windows(&painter.all_windows());
-                        }
                         visible = true; pending_hide = false;
                         visible_flag.store(true, Ordering::Relaxed);
                         surface.show()?;
@@ -155,13 +146,6 @@ fn render_loop(
                     if visible {
                         pending_hide = true;
                     } else {
-                        if let Some(ref mut tc) = thumbnailer {
-                            tc.request_output(0);
-                            if let Some(ws_id) = painter.active_workspace_id() {
-                                tc.request_output_for_ws(ws_id, 0);
-                            }
-                            tc.request_windows(&painter.all_windows());
-                        }
                         visible = true; pending_hide = false;
                         visible_flag.store(true, Ordering::Relaxed);
                         surface.show()?;
@@ -192,9 +176,12 @@ fn render_loop(
                 RenderCmd::UpdateSettings { show_empty } => painter.update_settings(show_empty),
                 RenderCmd::UpdateState { workspaces, metrics } => {
                     painter.update_state(workspaces, metrics);
-                    if let Some(ref mut tc) = thumbnailer {
-                        let ws = painter.all_windows();
-                        if !ws.is_empty() { tc.request_windows(&ws); }
+                    // Only request new screenshots when overlay is hidden
+                    if !visible {
+                        if let Some(ref mut tc) = thumbnailer {
+                            let ws = painter.all_windows();
+                            if !ws.is_empty() { tc.request_windows(&ws); }
+                        }
                     }
                 }
                 RenderCmd::Shutdown => { info!("render thread shutting down"); return Ok(()); }
@@ -269,6 +256,16 @@ fn render_loop(
                 visible_flag.store(false, Ordering::Relaxed);
                 painter.reset_kb();
                 surface.hide()?; // keyboard=None, buffer stays attached (transparent)
+
+                // Overlay is now hidden. Capture fresh screenshots so they don't
+                // include woven itself (Sway/Hyprland capture issue).
+                if let Some(ref mut tc) = thumbnailer {
+                    tc.request_output(0);
+                    if let Some(ws_id) = painter.active_workspace_id() {
+                        tc.request_output_for_ws(ws_id, 0);
+                    }
+                    tc.request_windows(&painter.all_windows());
+                }
             }
         }
 

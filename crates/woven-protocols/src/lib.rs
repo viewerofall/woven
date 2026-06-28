@@ -12,26 +12,27 @@
 //! the render loop.
 //!
 //! # Protocol path
+//! Niri (zwlr):
 //! ```text
-//! CaptureRequest { window_id, x, y, w, h }
-//!   → zwlr_screencopy_manager_v1.capture_output_region(output, x, y, w, h)
-//!   → buffer event  → ShmAlloc + wl_shm_pool + wl_buffer + copy()
-//!   → ready event   → ThumbnailFrame { window_id, width, height, stride, data }
+//! CaptureRequest → zwlr_screencopy_manager_v1.capture_output_region()
+//!   → buffer event → ShmAlloc + copy() → ready event → ThumbnailFrame
+//! ```
+//! Sway/Hyprland (ext-image):
+//! ```text
+//! CaptureRequest → ext_image_copy_capture_session_v1 → buffer_constraints
+//!   → create_frame → attach_buffer → capture() → ready → ThumbnailFrame
 //! ```
 
 pub mod screencopy;
+pub mod ext_image;
 pub mod shm;
 
 use std::{sync::Arc, thread::{self, JoinHandle}};
 
 use anyhow::Context;
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
-use rustix::event::{PollFd, PollFlags};
-use rustix::time::Timespec;
 use tracing::{error, info};
 use wayland_client::Connection;
-
-use crate::screencopy::ScreencopyState;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Public types
@@ -152,6 +153,22 @@ impl ScreencopyManager {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Backend detection
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScreencopyBackend {
+    Zwlr,     // Niri
+    ExtImage, // Sway/Hyprland
+}
+
+fn detect_backend() -> ScreencopyBackend {
+    // All three (Niri, Hyprland, Sway) advertise zwlr_screencopy_manager_v1.
+    // Use Zwlr for all to start.
+    ScreencopyBackend::Zwlr
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Thread entry — owns the Wayland connection for screencopy
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -159,69 +176,11 @@ fn run(
     request_rx: Receiver<CaptureRequest>,
     frame_tx:   Sender<ThumbnailFrame>,
 ) -> anyhow::Result<()> {
-    let conn    = Connection::connect_to_env().context("wayland connect")?;
-    let display = conn.display();
-    let mut queue = conn.new_event_queue::<ScreencopyState>();
-    let qh = queue.handle();
+    let backend = detect_backend();
+    info!("screencopy: using {:?} backend", backend);
 
-    let mut state = ScreencopyState::new(frame_tx);
-
-    // Trigger global enumeration.
-    let _registry = display.get_registry(&qh, ());
-    queue.roundtrip(&mut state).context("initial roundtrip")?;
-
-    if state.shm.is_none() {
-        anyhow::bail!("compositor did not advertise wl_shm");
-    }
-    if state.screencopy_manager.is_none() {
-        anyhow::bail!(
-            "compositor did not advertise zwlr_screencopy_manager_v1 — \
-Hyprland and Niri both support it; is the compositor running?"
-        );
-    }
-    if state.outputs.is_empty() {
-        anyhow::bail!("no wl_output found on screencopy connection");
-    }
-
-    info!(
-        "screencopy thread ready ({} output(s))",
-          state.outputs.len()
-    );
-
-    // Socket fd for poll — avoids busy-spinning when idle.
-    use std::os::fd::AsFd;
-    let conn_fd = conn.as_fd();
-
-    loop {
-        // ── 1. Accept incoming capture requests ───────────────────────────
-        loop {
-            match request_rx.try_recv() {
-                Ok(req)                       => state.issue_capture(&req, &qh),
-                Err(TryRecvError::Empty)      => break,
-                Err(TryRecvError::Disconnected) => {
-                    info!("screencopy request channel closed — exiting thread");
-                    return Ok(());
-                }
-            }
-        }
-
-        // ── 2. Flush pending outgoing Wayland requests ─────────────────────
-        queue.flush().context("queue flush")?;
-
-        // ── 3. Dispatch already-buffered events (non-blocking) ─────────────
-        queue.dispatch_pending(&mut state).context("dispatch_pending")?;
-
-        // ── 4. Poll + read from socket ─────────────────────────────────────
-        let timeout_ms: i64 = if state.pending_frames.is_empty() { 50 } else { 5 };
-        let ts = Timespec { tv_sec: 0, tv_nsec: timeout_ms * 1_000_000 };
-        let mut poll_fds = [PollFd::new(&conn_fd, PollFlags::IN)];
-        let _ = rustix::event::poll(&mut poll_fds, Some(&ts));
-
-        if let Some(guard) = queue.prepare_read() {
-            // read() blocks if there's data; returns quickly if polled readable.
-            guard.read().ok();
-        }
-
-        queue.dispatch_pending(&mut state).context("dispatch_pending post-read")?;
+    match backend {
+        ScreencopyBackend::Zwlr => screencopy::run_zwlr(request_rx, frame_tx),
+        ScreencopyBackend::ExtImage => ext_image::run_ext_image(request_rx, frame_tx),
     }
 }

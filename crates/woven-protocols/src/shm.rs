@@ -58,6 +58,12 @@ impl ShmAlloc {
         // SAFETY: compositor has finished writing; len matches the allocation.
         unsafe { slice::from_raw_parts(self.ptr, self.len) }
     }
+
+    /// Mutable access to pixel bytes for format conversion.
+    pub fn data_mut(&mut self) -> &mut [u8] {
+        // SAFETY: we own the allocation exclusively; len matches the mmap.
+        unsafe { slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
 }
 
 impl Drop for ShmAlloc {
