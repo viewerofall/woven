@@ -1021,11 +1021,11 @@ impl Painter {
             let is_sel = i == selected; let is_active = ws.active;
             let hovered = mx >= tx && mx <= tx+WS_THUMB_W && my >= thumb_y && my <= thumb_y+WS_THUMB_H;
             new_ws_thumbs.push(WsThumbRect { x: tx, y: thumb_y, w: WS_THUMB_W, h: WS_THUMB_H, ws_idx: i });
-            let border_col = if is_sel { parse_color(&theme.accent, 0.85) }
-            else if is_active { parse_color(&theme.accent, 0.45) }
-            else { parse_color(&theme.border, if hovered {0.45} else {0.22}) };
+            let border_col = if is_sel { parse_color(&theme.accent, 0.95) }
+            else if is_active { parse_color(&theme.accent, 0.60) }
+            else { parse_color(&theme.border, if hovered {0.60} else {0.35}) };
             let bw = if is_sel { 2.0f32 } else { 1.0 };
-            let r = (theme.border_radius as f32 * 0.6).min(WS_THUMB_W/2.0).min(WS_THUMB_H/2.0);
+            let r = (theme.border_radius as f32 * 0.8).min(WS_THUMB_W/2.0).min(WS_THUMB_H/2.0);
             fill_rrect(pm, tx-bw, thumb_y-bw, WS_THUMB_W+bw*2.0, WS_THUMB_H+bw*2.0, r+bw, border_col);
             fill_rrect(pm, tx, thumb_y, WS_THUMB_W, WS_THUMB_H, r,
                        parse_color(&theme.background, 0.75));
@@ -1145,8 +1145,8 @@ impl Painter {
             let r   = (theme.border_radius as f32).min(card_w/2.0).min(card_h/2.0);
             let hovered   = mx >= cx && mx <= cx+card_w && my >= cy && my <= cy+card_h;
             let kb_focused = self.kb_win == Some(new_cards.len());
-            let border_col = if kb_focused { parse_color(&theme.accent, 0.95) }
-                             else { parse_color(&theme.border, if hovered {0.45} else {0.20}) };
+            let border_col = if kb_focused { parse_color(&theme.accent, 0.98) }
+                             else { parse_color(&theme.border, if hovered {0.65} else {0.40}) };
             let inset = if kb_focused { 2.0f32 } else { 1.0f32 };
             fill_rrect(pm, cx-inset, cy-inset, card_w+inset*2.0, card_h+inset*2.0, r+inset, border_col);
             fill_rrect(pm, cx, cy, card_w, card_h, r,
@@ -1222,14 +1222,14 @@ impl Painter {
         let canvas_y   = view_y + (view_h - canvas_h) / 2.0;
 
         // Desktop backdrop: workspace screenshot or dim fill.
-        fill_rrect(pm, canvas_x - 2.0, canvas_y - 2.0, canvas_w + 4.0, canvas_h + 4.0, 8.0,
-                   parse_color(&theme.border, 0.22));
+        fill_rrect(pm, canvas_x - 2.0, canvas_y - 2.0, canvas_w + 4.0, canvas_h + 4.0, 10.0,
+                   parse_color(&theme.border, 0.35));
         if let Some(wid) = ws_id {
             if let Some((tw, th, ref px)) = self.workspace_cache.get(&wid).cloned() {
-                draw_thumbnail_clipped(pm, px, tw, th, canvas_x, canvas_y, canvas_w, canvas_h, 6.0);
+                draw_thumbnail_clipped(pm, px, tw, th, canvas_x, canvas_y, canvas_w, canvas_h, 8.0);
             } else {
-                fill_rrect(pm, canvas_x, canvas_y, canvas_w, canvas_h, 6.0,
-                           parse_color(&theme.background, 0.42));
+                fill_rrect(pm, canvas_x, canvas_y, canvas_w, canvas_h, 8.0,
+                           parse_color(&theme.background, 0.50));
             }
         }
 
@@ -1253,12 +1253,12 @@ impl Painter {
             let wh = wh.min(canvas_y + canvas_h - wy);
             if ww < 4.0 || wh < 4.0 { continue; }
 
-            let r   = 4.0f32.min(ww / 4.0).min(wh / 4.0);
+            let r   = 6.0f32.min(ww / 4.0).min(wh / 4.0);
             let hov        = mx >= wx && mx <= wx + ww && my >= wy && my <= wy + wh;
             let kb_focused = self.kb_win == Some(new_cards.len());
-            let border_col = if kb_focused { parse_color(&theme.accent, 0.95) }
-                             else { parse_color(&theme.border, if hov { 0.65 } else { 0.30 }) };
-            let inset = if kb_focused { 2.5f32 } else { 1.5f32 };
+            let border_col = if kb_focused { parse_color(&theme.accent, 0.98) }
+                             else { parse_color(&theme.border, if hov { 0.70 } else { 0.45 }) };
+            let inset = if kb_focused { 2.0f32 } else { 1.0f32 };
 
             // Window border + fill.
             fill_rrect(pm, wx - inset, wy - inset, ww + inset*2.0, wh + inset*2.0, r + inset, border_col);
@@ -1333,7 +1333,7 @@ impl Painter {
         let ws = match workspaces.get(ws_idx) { Some(w) => w, None => return };
         let shot = self.workspace_cache.get(&ws.id).cloned();
 
-        let pop_w = 800.0f32; let pop_h = 450.0f32; let r = 10.0f32;
+        let pop_w = 800.0f32; let pop_h = 450.0f32; let r = 14.0f32;
         // Position: below the thumbnail strip, centered on hovered card.
         let px = (ws_rect.x + ws_rect.w/2.0 - pop_w/2.0).max(4.0).min(sw - pop_w - 4.0);
         let py = ws_rect.y + ws_rect.h + 14.0;
@@ -1427,7 +1427,7 @@ impl Painter {
         let img_h = panel_h - hdr_h - 8.0 - 12.0;
         let img_w = sw - pad*2.0;
         if img_w > 10.0 && img_h > 10.0 {
-            let r = 8.0f32;
+            let r = 12.0f32;
             fill_rrect(pm, pad-2.0, img_y-2.0, img_w+4.0, img_h+4.0, r+2.0,
                        with_alpha(parse_color(&theme.border, 0.35), t));
             if let Some((tw, th, ref pxs)) = shot {

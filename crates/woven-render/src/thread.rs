@@ -15,6 +15,33 @@ use crate::draw::Painter;
 use crate::surface::{WovenSurface, MouseEvent};
 use crate::thumbnail::ThumbnailCapturer;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CompositorType {
+    Niri,
+    Sway,
+    Hyprland,
+    Other,
+}
+
+impl CompositorType {
+    fn detect() -> Self {
+        let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_lowercase();
+        if desktop.contains("niri") {
+            CompositorType::Niri
+        } else if desktop.contains("sway") {
+            CompositorType::Sway
+        } else if desktop.contains("hyprland") {
+            CompositorType::Hyprland
+        } else {
+            CompositorType::Other
+        }
+    }
+
+    fn supports_window_screencopy(self) -> bool {
+        self != CompositorType::Niri
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum RenderCmd {
     Show,
@@ -110,6 +137,8 @@ fn render_loop(
     info!("render loop starting");
 
     let (mouse_tx, mouse_rx) = unbounded::<MouseEvent>();
+    let compositor = CompositorType::detect();
+    info!("detected compositor: {:?}", compositor);
 
     let mut surface     = WovenSurface::new(mouse_tx)?;
     let mut painter     = Painter::new(theme, anims.clone(), action_tx.clone());
@@ -180,7 +209,9 @@ fn render_loop(
                     if !visible {
                         if let Some(ref mut tc) = thumbnailer {
                             let ws = painter.all_windows();
-                            if !ws.is_empty() { tc.request_windows(&ws); }
+                            if !ws.is_empty() && compositor.supports_window_screencopy() {
+                                tc.request_windows(&ws);
+                            }
                         }
                     }
                 }
@@ -218,7 +249,9 @@ fn render_loop(
                 if let Some(ws_id) = painter.active_workspace_id() {
                     tc.request_output_for_ws(ws_id, 0);
                 }
-                tc.request_windows(&painter.all_windows());
+                if compositor.supports_window_screencopy() {
+                    tc.request_windows(&painter.all_windows());
+                }
             }
             visible = true;
             visible_flag.store(true, Ordering::Relaxed);
@@ -264,7 +297,9 @@ fn render_loop(
                     if let Some(ws_id) = painter.active_workspace_id() {
                         tc.request_output_for_ws(ws_id, 0);
                     }
-                    tc.request_windows(&painter.all_windows());
+                    if compositor.supports_window_screencopy() {
+                        tc.request_windows(&painter.all_windows());
+                    }
                 }
             }
         }
